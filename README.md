@@ -1,3 +1,8 @@
+# CrossMaps
+## A Confidence-Aware Open-Vocabulary Semantic Mapping for Rover Navigation
+
+For Jetson-based UGV Waveshare rovers
+
 I run it with these parameters:
 
 python ~/vlmaps_ws/crossmaps_3_node.py --ros-args \

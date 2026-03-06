@@ -2,7 +2,9 @@
 # crossmaps_3_node.py
 import os
 import math
+import pickle
 import struct
+import tempfile
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -291,6 +293,12 @@ class CrossMaps3Node(Node):
         self.declare_parameter("history_voxel_m", 0.05)
         self.declare_parameter("history_max_points", 300000)
 
+        # persistence
+        self.declare_parameter("autoload_map_state", False)
+        self.declare_parameter("autosave_map_state", False)
+        self.declare_parameter("autosave_interval_s", 3.0)
+        self.declare_parameter("map_state_path", os.path.expanduser("~/.crossmaps/crossmaps_3_node_state.pkl"))
+
         # -------------------------
         # Read params (initial)
         # -------------------------
@@ -312,6 +320,7 @@ class CrossMaps3Node(Node):
         self.grid_height = int(self.grid_size_m / self.resolution)
         self.origin_x = -self.grid_size_m / 2.0
         self.origin_y = -self.grid_size_m / 2.0
+        self.map_state_path = os.path.expanduser(str(self.get_parameter("map_state_path").value))
 
         # -------------------------
         # STM state (INTERNAL frame grid coords)
@@ -332,6 +341,11 @@ class CrossMaps3Node(Node):
         # history cloud stored in INTERNAL frame voxel grid
         self.history_vox: Dict[Tuple[int, int, int], Tuple[float, float, float, float]] = {}
         self.white_rgb = pack_rgb(255, 255, 255)
+        self.latest_grids = self._empty_grid_bundle()
+        self.has_loaded_grid_snapshot = False
+        self.state_dirty = False
+        self.last_T_publish_internal: Optional[np.ndarray] = None
+        self.saved_T_publish_internal: Optional[np.ndarray] = None
 
         # Occupancy grid (publish_frame) for ray-consistency
         self.occ: Optional[dict] = None
@@ -395,6 +409,10 @@ class CrossMaps3Node(Node):
         self.pub_hist_cloud = self.create_publisher(PointCloud2, "/vlmaps/history_cloud", 1)
 
         self.timer = self.create_timer(1.0 / float(self.get_parameter("publish_hz").value), self.on_publish)
+        self.autosave_timer = self.create_timer(
+            float(self.get_parameter("autosave_interval_s").value),
+            self.on_autosave_timer,
+        )
 
         self.sub_cam = self.create_subscription(CameraInfo, self.cam_info_topic, self.on_cam_info, 10)
 
@@ -414,7 +432,10 @@ class CrossMaps3Node(Node):
         )
         self.ts.registerCallback(self.on_rgb_depth)
 
-        self.get_logger().info("CrossMaps v3 node started (STM + LTM, no tool map, no save/load).")
+        if bool(self.get_parameter("autoload_map_state").value):
+            self.load_map_state()
+
+        self.get_logger().info("CrossMaps v3 node started (STM + LTM, with save/load support).")
         self.get_logger().info(f"internal_frame={self.internal_frame}, publish_frame={self.publish_frame}")
         self.get_logger().info(
             "Publishes: "
@@ -428,6 +449,213 @@ class CrossMaps3Node(Node):
     # -------------------------
     def now_sec(self):
         return float(self.get_clock().now().nanoseconds) * 1e-9
+
+    def _empty_grid_bundle(self):
+        empty_sem = -np.ones((self.grid_height, self.grid_width), dtype=np.int8)
+        empty_conf = -np.ones((self.grid_height, self.grid_width), dtype=np.int8)
+        empty_top1 = -np.ones((self.grid_height, self.grid_width), dtype=np.int8)
+        return {
+            "stm_semantic": empty_sem.copy(),
+            "stm_confidence": empty_conf.copy(),
+            "stm_top1": empty_top1.copy(),
+            "ltm_semantic": empty_sem.copy(),
+            "ltm_confidence": empty_conf.copy(),
+            "ltm_top1": empty_top1.copy(),
+        }
+
+    def _mark_state_dirty(self):
+        self.state_dirty = True
+
+    def _serialize_vec_dict(self, data: Dict[Tuple[int, int], np.ndarray]):
+        if not data:
+            return {"keys": np.zeros((0, 2), dtype=np.int32), "values": np.zeros((0, 0), dtype=np.float32)}
+        keys = np.array(list(data.keys()), dtype=np.int32)
+        values = np.stack([np.asarray(data[k], dtype=np.float32) for k in data.keys()], axis=0)
+        return {"keys": keys, "values": values}
+
+    def _deserialize_vec_dict(self, payload) -> Dict[Tuple[int, int], np.ndarray]:
+        keys = np.asarray(payload.get("keys", np.zeros((0, 2), dtype=np.int32)), dtype=np.int32)
+        values = np.asarray(payload.get("values", np.zeros((0, 0), dtype=np.float32)), dtype=np.float32)
+        out: Dict[Tuple[int, int], np.ndarray] = {}
+        for idx, key_arr in enumerate(keys):
+            out[(int(key_arr[0]), int(key_arr[1]))] = values[idx].astype(np.float32)
+        return out
+
+    def _serialize_scalar_dict(self, data: Dict[Tuple[int, int], float], dtype):
+        if not data:
+            return {"keys": np.zeros((0, 2), dtype=np.int32), "values": np.zeros((0,), dtype=dtype)}
+        keys = np.array(list(data.keys()), dtype=np.int32)
+        values = np.array([data[k] for k in data.keys()], dtype=dtype)
+        return {"keys": keys, "values": values}
+
+    def _deserialize_scalar_dict(self, payload, value_cast):
+        keys = np.asarray(payload.get("keys", np.zeros((0, 2), dtype=np.int32)), dtype=np.int32)
+        values = payload.get("values", np.zeros((0,), dtype=np.float32))
+        out = {}
+        for idx, key_arr in enumerate(keys):
+            out[(int(key_arr[0]), int(key_arr[1]))] = value_cast(values[idx])
+        return out
+
+    def _serialize_history_vox(self):
+        if not self.history_vox:
+            return {"keys": np.zeros((0, 3), dtype=np.int32), "values": np.zeros((0, 4), dtype=np.float32)}
+        keys = np.array(list(self.history_vox.keys()), dtype=np.int32)
+        values = np.array(list(self.history_vox.values()), dtype=np.float32)
+        return {"keys": keys, "values": values}
+
+    def _deserialize_history_vox(self, payload):
+        keys = np.asarray(payload.get("keys", np.zeros((0, 3), dtype=np.int32)), dtype=np.int32)
+        values = np.asarray(payload.get("values", np.zeros((0, 4), dtype=np.float32)), dtype=np.float32)
+        out = {}
+        for idx, key_arr in enumerate(keys):
+            out[(int(key_arr[0]), int(key_arr[1]), int(key_arr[2]))] = tuple(float(v) for v in values[idx])
+        return out
+
+    def _metadata_snapshot(self):
+        return {
+            "grid_width": int(self.grid_width),
+            "grid_height": int(self.grid_height),
+            "grid_size_m": float(self.grid_size_m),
+            "resolution": float(self.resolution),
+            "origin_x": float(self.origin_x),
+            "origin_y": float(self.origin_y),
+            "internal_frame": str(self.internal_frame),
+            "publish_frame": str(self.publish_frame),
+        }
+
+    def _grid_bundle_from_payload(self, payload):
+        bundle = self._empty_grid_bundle()
+        for name in bundle.keys():
+            if name not in payload:
+                continue
+            arr = np.asarray(payload[name], dtype=np.int8)
+            if arr.shape != (self.grid_height, self.grid_width):
+                raise ValueError(f"Stored grid '{name}' has shape {arr.shape}, expected {(self.grid_height, self.grid_width)}")
+            bundle[name] = arr.copy()
+        return bundle
+
+    def _serialize_transform(self, T: Optional[np.ndarray]):
+        if T is None:
+            return None
+        arr = np.asarray(T, dtype=np.float32)
+        if arr.shape != (4, 4):
+            raise ValueError(f"Transform must have shape (4, 4), got {arr.shape}")
+        return arr.copy()
+
+    def _deserialize_transform(self, payload) -> Optional[np.ndarray]:
+        if payload is None:
+            return None
+        arr = np.asarray(payload, dtype=np.float32)
+        if arr.shape != (4, 4):
+            raise ValueError(f"Stored transform must have shape (4, 4), got {arr.shape}")
+        return arr.copy()
+
+    def lookup_saved_or_live_T_publish_internal(self, stamp_msg=None):
+        T_live = self.lookup_T_publish_internal(stamp_msg)
+        if T_live is not None:
+            self.last_T_publish_internal = T_live.copy()
+            return T_live
+        if self.saved_T_publish_internal is not None:
+            return self.saved_T_publish_internal.copy()
+        return None
+
+    def publish_cached_grids(self):
+        bundle = self.latest_grids
+        if bool(self.get_parameter("publish_stm_semantic_grid").value):
+            self.publish_grid(bundle["stm_semantic"], self.pub_stm_sem)
+        if bool(self.get_parameter("publish_stm_confidence_grid").value):
+            self.publish_grid(bundle["stm_confidence"], self.pub_stm_conf)
+        if bool(self.get_parameter("publish_stm_top1_grid").value):
+            self.publish_grid(bundle["stm_top1"], self.pub_stm_top1)
+        if bool(self.get_parameter("publish_ltm_semantic_grid").value):
+            self.publish_grid(bundle["ltm_semantic"], self.pub_ltm_sem)
+        if bool(self.get_parameter("publish_ltm_confidence_grid").value):
+            self.publish_grid(bundle["ltm_confidence"], self.pub_ltm_conf)
+        if bool(self.get_parameter("publish_ltm_top1_grid").value):
+            self.publish_grid(bundle["ltm_top1"], self.pub_ltm_top1)
+
+    def _set_latest_grid(self, name: str, grid: np.ndarray):
+        grid_copy = grid.copy()
+        if not np.array_equal(self.latest_grids[name], grid_copy):
+            self.latest_grids[name] = grid_copy
+            self._mark_state_dirty()
+
+    def save_map_state(self):
+        try:
+            parent = os.path.dirname(self.map_state_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+            payload = {
+                "version": 1,
+                "metadata": self._metadata_snapshot(),
+                "saved_T_publish_internal": self._serialize_transform(self.last_T_publish_internal),
+                "stm_sum": self._serialize_vec_dict(self.stm_sum),
+                "stm_w": self._serialize_scalar_dict(self.stm_w, np.float32),
+                "stm_last": self._serialize_scalar_dict(self.stm_last, np.float64),
+                "stm_viewmask": self._serialize_scalar_dict(self.stm_viewmask, np.uint32),
+                "ltm_sum": self._serialize_vec_dict(self.ltm_sum),
+                "ltm_w": self._serialize_scalar_dict(self.ltm_w, np.float32),
+                "ltm_last_seen": self._serialize_scalar_dict(self.ltm_last_seen, np.float64),
+                "ltm_viewmask": self._serialize_scalar_dict(self.ltm_viewmask, np.uint32),
+                "history_vox": self._serialize_history_vox(),
+                "latest_grids": {name: grid.copy() for name, grid in self.latest_grids.items()},
+                "query_text": str(self.query_text),
+            }
+
+            with tempfile.NamedTemporaryFile("wb", dir=parent or ".", delete=False) as tmp_file:
+                pickle.dump(payload, tmp_file, protocol=pickle.HIGHEST_PROTOCOL)
+                tmp_path = tmp_file.name
+            os.replace(tmp_path, self.map_state_path)
+            self.state_dirty = False
+        except Exception as e:
+            self.get_logger().warn(f"Failed to save map state to '{self.map_state_path}': {e}")
+
+    def load_map_state(self):
+        if not os.path.exists(self.map_state_path):
+            return
+        try:
+            with open(self.map_state_path, "rb") as f:
+                payload = pickle.load(f)
+
+            metadata = payload.get("metadata", {})
+            current_meta = self._metadata_snapshot()
+            for key, value in current_meta.items():
+                if metadata.get(key) != value:
+                    raise ValueError(f"Metadata mismatch for '{key}': stored={metadata.get(key)} current={value}")
+
+            self.stm_sum = self._deserialize_vec_dict(payload.get("stm_sum", {}))
+            self.stm_w = self._deserialize_scalar_dict(payload.get("stm_w", {}), float)
+            self.stm_last = self._deserialize_scalar_dict(payload.get("stm_last", {}), float)
+            self.stm_viewmask = self._deserialize_scalar_dict(payload.get("stm_viewmask", {}), int)
+            self.ltm_sum = self._deserialize_vec_dict(payload.get("ltm_sum", {}))
+            self.ltm_w = self._deserialize_scalar_dict(payload.get("ltm_w", {}), float)
+            self.ltm_last_seen = self._deserialize_scalar_dict(payload.get("ltm_last_seen", {}), float)
+            self.ltm_viewmask = self._deserialize_scalar_dict(payload.get("ltm_viewmask", {}), int)
+            self.history_vox = self._deserialize_history_vox(payload.get("history_vox", {}))
+            self.latest_grids = self._grid_bundle_from_payload(payload.get("latest_grids", {}))
+            self.saved_T_publish_internal = self._deserialize_transform(payload.get("saved_T_publish_internal"))
+            self.last_T_publish_internal = self.saved_T_publish_internal.copy() if self.saved_T_publish_internal is not None else None
+            self.has_loaded_grid_snapshot = True
+            self.state_dirty = False
+            self.get_logger().info(
+                f"Loaded map state from '{self.map_state_path}' "
+                f"(STM={len(self.stm_w)}, LTM={len(self.ltm_w)}, history={len(self.history_vox)})"
+            )
+            if self.saved_T_publish_internal is None:
+                self.get_logger().warn(
+                    "Loaded map state has no saved publish/internal transform. "
+                    "Offline query changes may not work without live TF."
+                )
+        except Exception as e:
+            self.get_logger().warn(f"Failed to load map state from '{self.map_state_path}': {e}")
+
+    def on_autosave_timer(self):
+        if not bool(self.get_parameter("autosave_map_state").value):
+            return
+        if not self.state_dirty:
+            return
+        self.save_map_state()
 
     def on_cam_info(self, msg: CameraInfo):
         self.fx = float(msg.k[0])
@@ -500,6 +728,11 @@ class CrossMaps3Node(Node):
         if new_query != self.query_text:
             self.query_text = new_query
             self.text_emb = None
+            self.text_emb_query = None
+            self.has_loaded_grid_snapshot = False
+            empty = self._empty_grid_bundle()
+            for name, grid in empty.items():
+                self._set_latest_grid(name, grid)
             self.get_logger().info(f"Updated query_text -> '{self.query_text}'")
 
         if self.text_emb is None or self.text_emb_query != self.query_text:
@@ -537,6 +770,7 @@ class CrossMaps3Node(Node):
         self.stm_w[key] *= decay
         #self.stm_sum[key] *= decay  # this activates decay on the embedding too
         self.stm_last[key] = now_s
+        self._mark_state_dirty()
         if self.stm_w[key] < 1e-3:
             self.stm_w.pop(key, None)
             self.stm_sum.pop(key, None)
@@ -585,8 +819,10 @@ class CrossMaps3Node(Node):
         b = int(math.floor((ang + math.pi) / (2.0 * math.pi) * bins))
         b = max(0, min(bins - 1, b))
         mask = viewmask_dict.get(key, 0)
-        mask |= (1 << b)
-        viewmask_dict[key] = mask
+        new_mask = mask | (1 << b)
+        viewmask_dict[key] = new_mask
+        if new_mask != mask:
+            self._mark_state_dirty()
 
     # -------------------------
     # STM fusion: soft gating
@@ -620,6 +856,7 @@ class CrossMaps3Node(Node):
             self.stm_w[key] = float(conf)
             self.stm_last[key] = now_s
             self.stm_viewmask[key] = self.stm_viewmask.get(key, 0)
+            self._mark_state_dirty()
             return
 
         emb_old, _, _ = self.stm_embedding_and_coherence(key)
@@ -627,6 +864,7 @@ class CrossMaps3Node(Node):
             self.stm_sum[key] = (conf * new_emb_unit).astype(np.float32)
             self.stm_w[key] = float(conf)
             self.stm_last[key] = now_s
+            self._mark_state_dirty()
             return
 
         if use_gating:
@@ -640,6 +878,7 @@ class CrossMaps3Node(Node):
         self.stm_sum[key] = (self.stm_sum[key] + conf * new_emb_unit).astype(np.float32)
         self.stm_w[key] = min(float(self.stm_w[key] + conf), w_max)
         self.stm_last[key] = now_s
+        self._mark_state_dirty()
 
     # -------------------------
     # LTM update: promote & contradiction replace
@@ -669,6 +908,7 @@ class CrossMaps3Node(Node):
             self.ltm_last_seen[stm_key] = now_s
             # also bring over view diversity as a hint for future merging
             self.ltm_viewmask[stm_key] = int(self.stm_viewmask.get(stm_key, 0))
+            self._mark_state_dirty()
             return
 
         old_u, _, old_w = self.ltm_embedding_and_coherence(stm_key)
@@ -677,6 +917,7 @@ class CrossMaps3Node(Node):
             self.ltm_w[stm_key] = float(np.clip(ev_w, 0.0, ltm_w_max))
             self.ltm_last_seen[stm_key] = now_s
             self.ltm_viewmask[stm_key] = int(self.stm_viewmask.get(stm_key, 0))
+            self._mark_state_dirty()
             return
 
         cos = float(np.dot(old_u, emb_unit))
@@ -689,6 +930,7 @@ class CrossMaps3Node(Node):
             self.ltm_last_seen[stm_key] = now_s
             # update viewmask union
             self.ltm_viewmask[stm_key] = int(self.ltm_viewmask.get(stm_key, 0) | int(self.stm_viewmask.get(stm_key, 0)))
+            self._mark_state_dirty()
             return
 
         # Consistent: aggregate
@@ -698,6 +940,7 @@ class CrossMaps3Node(Node):
         self.ltm_w[stm_key] = new_w
         self.ltm_last_seen[stm_key] = now_s
         self.ltm_viewmask[stm_key] = int(self.ltm_viewmask.get(stm_key, 0) | int(self.stm_viewmask.get(stm_key, 0)))
+        self._mark_state_dirty()
 
     # -------------------------
     # Coherence shaping
@@ -821,7 +1064,9 @@ class CrossMaps3Node(Node):
                     Time.from_msg(stamp_msg),
                     timeout=Duration(seconds=0.3),
                 )
-            return transform_to_matrix(tf)
+            T = transform_to_matrix(tf)
+            self.last_T_publish_internal = T.copy()
+            return T
         except Exception:
             return None
 
@@ -836,6 +1081,7 @@ class CrossMaps3Node(Node):
         if len(self.history_vox) >= max_pts:
             return
         inv = 1.0 / voxel
+        added = False
         for p in pts_internal:
             vx = int(np.floor(p[0] * inv))
             vy = int(np.floor(p[1] * inv))
@@ -844,8 +1090,11 @@ class CrossMaps3Node(Node):
             if k in self.history_vox:
                 continue
             self.history_vox[k] = (float(p[0]), float(p[1]), float(p[2]), self.white_rgb)
+            added = True
             if len(self.history_vox) >= max_pts:
                 break
+        if added:
+            self._mark_state_dirty()
 
     def publish_history_cloud(self):
         if not bool(self.get_parameter("publish_history_cloud").value):
@@ -1151,19 +1400,16 @@ class CrossMaps3Node(Node):
         empty_top1 = -np.ones((self.grid_height, self.grid_width), dtype=np.int8)
 
         if self.text_emb is None:
-            if bool(self.get_parameter("publish_stm_semantic_grid").value):
-                self.publish_grid(empty_sem, self.pub_stm_sem)
-            if bool(self.get_parameter("publish_stm_confidence_grid").value):
-                self.publish_grid(empty_conf, self.pub_stm_conf)
-            if bool(self.get_parameter("publish_stm_top1_grid").value):
-                self.publish_grid(empty_top1, self.pub_stm_top1)
-
-            if bool(self.get_parameter("publish_ltm_semantic_grid").value):
-                self.publish_grid(empty_sem, self.pub_ltm_sem)
-            if bool(self.get_parameter("publish_ltm_confidence_grid").value):
-                self.publish_grid(empty_conf, self.pub_ltm_conf)
-            if bool(self.get_parameter("publish_ltm_top1_grid").value):
-                self.publish_grid(empty_top1, self.pub_ltm_top1)
+            if self.has_loaded_grid_snapshot:
+                self.publish_cached_grids()
+            else:
+                self._set_latest_grid("stm_semantic", empty_sem)
+                self._set_latest_grid("stm_confidence", empty_conf)
+                self._set_latest_grid("stm_top1", empty_top1)
+                self._set_latest_grid("ltm_semantic", empty_sem)
+                self._set_latest_grid("ltm_confidence", empty_conf)
+                self._set_latest_grid("ltm_top1", empty_top1)
+                self.publish_cached_grids()
             return
 
         # decay some STM cells
@@ -1173,8 +1419,10 @@ class CrossMaps3Node(Node):
             self.decay_stm_cell(k, now_s)
 
         # need transform internal->publish for both STM and LTM grids
-        T = self.lookup_T_publish_internal()
+        T = self.lookup_saved_or_live_T_publish_internal()
         if T is None:
+            if self.has_loaded_grid_snapshot:
+                self.publish_cached_grids()
             return
 
         use_view = bool(self.get_parameter("use_visibility_boost").value)
@@ -1186,6 +1434,9 @@ class CrossMaps3Node(Node):
         # -------------------------
         stm_keys = list(self.stm_w.keys())
         if len(stm_keys) < 20:
+            self._set_latest_grid("stm_semantic", empty_sem)
+            self._set_latest_grid("stm_confidence", empty_conf)
+            self._set_latest_grid("stm_top1", empty_top1)
             if bool(self.get_parameter("publish_stm_semantic_grid").value):
                 self.publish_grid(empty_sem, self.pub_stm_sem)
             if bool(self.get_parameter("publish_stm_confidence_grid").value):
@@ -1207,6 +1458,9 @@ class CrossMaps3Node(Node):
             )
 
             if res_stm is None or len(stm_cells_pub) < 10:
+                self._set_latest_grid("stm_semantic", empty_sem)
+                self._set_latest_grid("stm_confidence", empty_conf)
+                self._set_latest_grid("stm_top1", empty_top1)
                 if bool(self.get_parameter("publish_stm_semantic_grid").value):
                     self.publish_grid(empty_sem, self.pub_stm_sem)
                 if bool(self.get_parameter("publish_stm_confidence_grid").value):
@@ -1219,6 +1473,9 @@ class CrossMaps3Node(Node):
                 sem_grid, conf_grid, top1_grid = self._build_sem_conf_top1_grids(
                     stm_cells_pub, scores_np, confs_np
                 )
+                self._set_latest_grid("stm_semantic", sem_grid)
+                self._set_latest_grid("stm_confidence", conf_grid)
+                self._set_latest_grid("stm_top1", top1_grid)
 
                 if bool(self.get_parameter("publish_stm_semantic_grid").value):
                     self.publish_grid(sem_grid, self.pub_stm_sem)
@@ -1250,6 +1507,9 @@ class CrossMaps3Node(Node):
         # -------------------------
         ltm_keys = list(self.ltm_w.keys())
         if len(ltm_keys) < 20:
+            self._set_latest_grid("ltm_semantic", empty_sem)
+            self._set_latest_grid("ltm_confidence", empty_conf)
+            self._set_latest_grid("ltm_top1", empty_top1)
             if bool(self.get_parameter("publish_ltm_semantic_grid").value):
                 self.publish_grid(empty_sem, self.pub_ltm_sem)
             if bool(self.get_parameter("publish_ltm_confidence_grid").value):
@@ -1272,6 +1532,9 @@ class CrossMaps3Node(Node):
         )
 
         if res_ltm is None or len(ltm_cells_pub) < 10:
+            self._set_latest_grid("ltm_semantic", empty_sem)
+            self._set_latest_grid("ltm_confidence", empty_conf)
+            self._set_latest_grid("ltm_top1", empty_top1)
             if bool(self.get_parameter("publish_ltm_semantic_grid").value):
                 self.publish_grid(empty_sem, self.pub_ltm_sem)
             if bool(self.get_parameter("publish_ltm_confidence_grid").value):
@@ -1282,6 +1545,9 @@ class CrossMaps3Node(Node):
 
         _, _, scores_ltm, confs_ltm, _ = res_ltm
         sem_ltm, conf_ltm, top1_ltm = self._build_sem_conf_top1_grids(ltm_cells_pub, scores_ltm, confs_ltm)
+        self._set_latest_grid("ltm_semantic", sem_ltm)
+        self._set_latest_grid("ltm_confidence", conf_ltm)
+        self._set_latest_grid("ltm_top1", top1_ltm)
 
         if bool(self.get_parameter("publish_ltm_semantic_grid").value):
             self.publish_grid(sem_ltm, self.pub_ltm_sem)
@@ -1321,6 +1587,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if bool(node.get_parameter("autosave_map_state").value):
+            node.save_map_state()
         node.destroy_node()
         rclpy.shutdown()
 

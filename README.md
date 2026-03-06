@@ -3,11 +3,11 @@
 
 For Jetson-based UGV Waveshare rovers
 
-To load the presaved semantic map: Put the *crossmaps_3_node_state.pkl* file into a directory ~/.crossmaps
+To load the presaved semantic map (in /data): Put the *crossmaps_3_node_state.pkl* file into a directory ~/.crossmaps
 
 
-Run it with these parameters to load the state:
-(**Important** - the time decay will cause the STM to appear empty if you load it with these parameters. You need to either set ```decay_half_life_s``` several orders of magnitude higher or comment out the time decay before running (line 770: ```self.stm_w[key] *= decay```). The LTM should be stable either way.)
+These are the parameters I use to run the system, you can use them to load the saved semantic map too:
+(**Important** - the time decay will cause the STM to appear empty if you load it with these parameters. You need to either set ```decay_half_life_s``` several orders of magnitude higher (eg. 1200000) or comment out the time decay before running (line 770: ```self.stm_w[key] *= decay```). The LTM should be stable either way.)
 
 <pre>
 python ~/vlmaps_ws/crossmaps_6_node.py --ros-args \

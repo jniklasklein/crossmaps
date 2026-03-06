@@ -3,9 +3,14 @@
 
 For Jetson-based UGV Waveshare rovers
 
-I run it with these parameters:
+To load the presaved semantic map: Put the *crossmaps_3_node_state.pkl* file into a directory ~/.crossmaps
 
-python ~/vlmaps_ws/crossmaps_3_node.py --ros-args \
+
+Run it with these parameters to load the state:
+(**Important** - the time decay will cause the STM to appear empty if you load it with these parameters. You need to either set ```decay_half_life_s``` several orders of magnitude higher or comment out the time decay before running (line 770: ```self.stm_w[key] *= decay```). The LTM should be stable either way.)
+
+<pre>
+python ~/vlmaps_ws/crossmaps_6_node.py --ros-args \
   -p internal_frame:=odom \
   -p publish_frame:=map \
   -p use_ray_consistency:=true \
@@ -28,4 +33,16 @@ python ~/vlmaps_ws/crossmaps_3_node.py --ros-args \
   -p ltm_replace_gain:=3.0 \
   -p promote_min_conf:=0.55 \
   -p promote_min_coh01:=0.40 \
-  -p promote_min_views:=2
+  -p promote_min_views:=2 \
+  -p autoload_map_state:=true
+</pre>
+
+
+  Then, in a second terminal and open ```rviz2```
+
+  You can set queries in a third terminal with:
+<pre>
+ ros2 param set /crossmaps_3_node query_text plant 
+</pre>
+
+  

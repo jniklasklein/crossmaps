@@ -3,7 +3,7 @@
 
 For Jetson-based UGV Waveshare rovers
 
-Read the replication guide first to set up the rover and your computer.
+Read the replication guide first to set up the rover and your computer. In case you only want to explore the presaced semantic map, you only need to follow the set up guide on your computer (Installing RoboStack environment, ROS2 + Rviz2), not the rover set up.
 
 To load the presaved semantic map (in /data): Put the *crossmaps_3_node_state.pkl* file into a directory ~/.crossmaps
 

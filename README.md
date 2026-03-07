@@ -3,6 +3,8 @@
 
 For Jetson-based UGV Waveshare rovers
 
+Read the replication guide first to set up the rover and your computer.
+
 To load the presaved semantic map (in /data): Put the *crossmaps_3_node_state.pkl* file into a directory ~/.crossmaps
 
 
@@ -38,7 +40,7 @@ python ~/vlmaps_ws/crossmaps_6_node.py --ros-args \
 </pre>
 
 
-  Then, in a second terminal and open ```rviz2```
+  Then, in a second terminal, open ```rviz2```
 
   You can set queries in a third terminal with:
 <pre>

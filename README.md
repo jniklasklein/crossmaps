@@ -10,7 +10,7 @@ This repository supports two use cases:
 ## Demo Video
 
 ```md
-[![Watch the demo](docs/demo_thumbnail.png)](https://youtu.be/vMQndtoBYTU)
+https://youtu.be/vMQndtoBYTU
 ```
 
 

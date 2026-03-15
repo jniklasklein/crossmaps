@@ -445,8 +445,8 @@ If the saved state is loaded successfully:
 This is expected with the paper configuration because STM uses time decay. If you load an old snapshot with a short half-life, STM may fade immediately.
 
 Two common fixes are:
-- set `decay_half_life_s` to a much larger value such as `1200000`
-- comment out the STM decay update in [`crossmaps_3_node.py`](/Users/niklasklein/Documents/Projekte/HPI/crossmaps-ws/crossmaps_3_node.py#L770) if you are explicitly inspecting old STM state
+- set `decay_half_life_s` to a much larger value such as `12000000`
+- comment out the STM decay update in `crossmaps_3_node.py` if you are explicitly inspecting old STM state
 
 The LTM should remain the more stable artifact for inspection.
 

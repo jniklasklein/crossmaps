@@ -33,7 +33,7 @@ from voxel_scoring import score_voxels
 from identity_graph import IdentityConfig, ObservationEdges, PersistentEntities
 
 
-NODE_PATH = Path(__file__).resolve().parents[1] / "crossmaps_node.py"
+NODE_PATH = Path(__file__).resolve().parents[1] / "crossmaps_v2_node.py"
 TREE = ast.parse(NODE_PATH.read_text())
 CLASS = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "CrossMapsNode")
 DEFAULTS = {}

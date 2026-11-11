@@ -26,29 +26,36 @@ From the repository root, with the ROS 2/model environment active, run these
 in separate terminals:
 
 ```sh
-python3 crossmaps_dino_experimental/crossmaps_node.py
+python3 crossmaps_dino_experimental/crossmaps_v2_node.py
 ```
 
 ```sh
-python3 crossmaps_dino_experimental/crossmaps_dashboard.py
+python crossmaps_dino_experimental/crossmaps_dashboard.py
 ```
 
 Open **http://127.0.0.1:8765**. The robot's RGB-D camera and TF publishers must
 already be running. Start only one perception node. External dependencies and
 weight locations are listed in [FILES.md](FILES.md).
 
+The browser dashboard is the primary interface; RViz2 is not required. Activate
+the same ROS/Python environment in both terminals (on the existing MacBook,
+`conda activate ros_humble_env`). Both `python3` and `python` must resolve to
+that environment. The dashboard targets `/crossmaps_v2_node` by default.
+
 ### Naming and compatibility
 
-`crossmaps_node.py` is the maintained perception entry point. The dashboard
+`crossmaps_v2_node.py` is the maintained perception entry point. The dashboard
 entry point remains `crossmaps_dashboard.py`; helper modules use descriptive
 names such as `identity_graph.py` and `dominant_overlay.py`.
 
 The directory name `crossmaps_dino_experimental/` is retained for path
 compatibility: local `.runtime/` maps, logs, model-weight lookup, and existing
-workspace references stay in place. The ROS node name `/crossmaps_3_node`,
-`/crossmaps/...` topics, source IDs and serialized schema versions also remain
-unchanged. Those compatibility identifiers are not the product version.
-Update launch commands to use `crossmaps_node.py`; the old dated entry-point
+workspace references stay in place. The ROS node is now `/crossmaps_v2_node`;
+the dashboard defaults to that target. Use underscores, not hyphens, in ROS
+node names. `/crossmaps/...` topics, source IDs and serialized schema versions
+remain unchanged. Update any custom parameter commands or node-keyed YAML
+configuration to use the new node name.
+Update launch commands to use `crossmaps_v2_node.py`; the old dated entry-point
 filename is no longer used. This naming cleanup changes no inference defaults
 or association behavior, and does not claim that upstream yaw drift is solved.
 
@@ -448,7 +455,7 @@ For a reliable wired link, raw inputs remain available by explicitly setting all
 four parameters at startup:
 
 ```sh
-python3 crossmaps_node.py --ros-args \
+python3 crossmaps_v2_node.py --ros-args \
   -p rgb_topic:=/oak/rgb/image_rect -p rgb_compressed:=false \
   -p depth_topic:=/oak/stereo/image_raw -p depth_compressed:=false
 ```

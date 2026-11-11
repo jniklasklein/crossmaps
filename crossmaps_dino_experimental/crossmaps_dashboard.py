@@ -1930,7 +1930,7 @@ def make_handler(dashboard: CrossMapsDashboard):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CrossMaps v2 browser dashboard")
-    parser.add_argument("--target-node", default="/crossmaps_3_node", help="CrossMaps ROS node name")
+    parser.add_argument("--target-node", default="/crossmaps_v2_node", help="CrossMaps ROS node name")
     parser.add_argument("--host", default="127.0.0.1", help="HTTP bind address")
     parser.add_argument("--port", default=8765, type=int, help="HTTP port, use 0 for an ephemeral port")
     parser.add_argument("--static-dir", default=str(APP_DIR), help="Dashboard static asset directory")

@@ -298,7 +298,7 @@ class CrossMapsNode(Node):
     """
 
     def __init__(self):
-        super().__init__("crossmaps_3_node")
+        super().__init__("crossmaps_v2_node")
         self.bridge = CvBridge()
         self.frame_counter = 0
         self.publish_counter = 0

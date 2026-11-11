@@ -9,7 +9,7 @@ this is not a general accuracy or mobile-localization guarantee.
 
 | File | Purpose |
 | --- | --- |
-| `crossmaps_node.py` | Perception entry point: RGB-D transport, eSAM/CLIP/DINO inference, fusion, ROS publications. |
+| `crossmaps_v2_node.py` | Perception entry point: RGB-D transport, eSAM/CLIP/DINO inference, fusion, ROS publications. |
 | `identity_graph.py` | Persistent entity membership, near-tie evidence, and temporal graph relations. |
 | `object_assembly.py` | Reversible DINO/contact grouping of established parts; retains separate segments. |
 | `surface_tracking.py` | Temporal surface consensus and bounded ownership corrections. |
@@ -48,14 +48,16 @@ Use the existing ROS 2 environment with the dependencies below available.
 From the repository root, in separate terminals:
 
 ```sh
-python3 crossmaps_dino_experimental/crossmaps_node.py
+python3 crossmaps_dino_experimental/crossmaps_v2_node.py
 ```
 
 ```sh
-python3 crossmaps_dino_experimental/crossmaps_dashboard.py
+python crossmaps_dino_experimental/crossmaps_dashboard.py
 ```
 
-Open `http://127.0.0.1:8765`. Start only one CrossMaps perception process.
+Open `http://127.0.0.1:8765`. The dashboard is the primary interface; RViz2 is
+not required. Use the same ROS/Python environment in both terminals. Start only
+one CrossMaps perception process.
 The robot's camera, depth, camera-info and TF publishers must already be running.
 Defaults retain eSAM `vitt`, CLIP `ViT-L-14`/`openai`, DINOv2 `vits14`, compressed
 RGB/depth transport, and **stationary pose lock off**. Default map autoload and
@@ -63,8 +65,9 @@ autosave are off. Robot-side sources and launch configuration are not part of
 this snapshot.
 
 The branch is `crossmaps-v2`. The existing `crossmaps_dino_experimental/`
-directory, ROS node name `/crossmaps_3_node`, topics, and stored-map schema
-identifiers are deliberately retained for compatibility. The renamed entry
+directory, topics, and stored-map schema identifiers are deliberately retained
+for compatibility. The ROS node is `/crossmaps_v2_node`, and the dashboard's
+default target matches it. The renamed entry
 point does not move or delete local data. See README.md for naming details.
 
 ## External prerequisites, not repository source
@@ -107,7 +110,7 @@ node --check crossmaps_dashboard/app.js
 python3 -B replay_identity.py --demo
 ```
 
-At the 2026-11-11 source inventory, 181 Python tests and the dashboard checks
+At the 2026-11-11 launch-documentation update, 182 Python tests and the dashboard checks
 passed using the existing local environment. The tests do not initialize the
 neural models or validate live mobile mapping. No robot/node restart is needed
 to create this Git snapshot.

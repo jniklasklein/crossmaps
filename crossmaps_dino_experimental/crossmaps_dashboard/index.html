@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CrossMaps Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">CM</div>
+          <div>
+            <h1>CrossMaps</h1>
+            <div class="subline">
+              <span id="connection-dot" class="status-dot"></span>
+              <span id="connection-text">connecting</span>
+              <span class="sep"></span>
+              <span id="target-node"></span>
+            </div>
+          </div>
+        </div>
+
+        <form id="query-form" class="query-bar">
+          <input id="query-input" type="text" autocomplete="off" spellcheck="false" placeholder="query">
+          <button type="submit" title="Apply query">Apply</button>
+        </form>
+
+        <div class="top-actions">
+          <div id="cycle-status" class="battery-status" title="Full observation cycle timing">Cycle --</div>
+          <div id="battery-status" class="battery-status" title="Battery status">Battery --</div>
+          <button id="refresh-params" title="Refresh parameters">Refresh</button>
+          <button id="reset-view" title="Reset 3D view">Reset View</button>
+        </div>
+      </header>
+
+      <main class="dashboard-grid">
+        <aside class="panel left-panel">
+          <div class="panel-head">
+            <h2>Parameters</h2>
+            <div class="preset-row">
+              <select id="preset-select" title="Preset"></select>
+              <input id="preset-name" type="text" autocomplete="off" spellcheck="false" placeholder="new config" title="Configuration name">
+              <button id="preset-apply" title="Apply preset">Apply</button>
+              <button id="preset-save" title="Save preset">Save</button>
+              <button id="preset-delete" title="Delete preset">Delete</button>
+            </div>
+          </div>
+          <nav id="param-tabs" class="tab-strip" aria-label="Parameter groups"></nav>
+          <div class="param-apply-bar">
+            <label class="inline-toggle" title="Apply parameter edits immediately">
+              <input id="live-apply-toggle" type="checkbox" checked>
+              <span>Live Apply</span>
+            </label>
+            <button id="apply-staged-params" title="Apply staged parameter changes">Apply Changes</button>
+            <span id="staged-count" class="staged-count">0 staged</span>
+          </div>
+          <div id="param-groups" class="param-groups"></div>
+        </aside>
+
+        <section class="viewer-section">
+          <div class="viewer-toolbar">
+            <div id="layer-controls" class="layer-controls"></div>
+            <div class="viewer-tools">
+              <label class="compact-field">
+                <span>Points</span>
+                <input id="point-size" type="range" min="1" max="16" step="0.5" value="4">
+              </label>
+              <label class="compact-field">
+                <span>Bright</span>
+                <input id="point-glow" type="range" min="1" max="3" step="0.05" value="1.15">
+              </label>
+              <label class="compact-field">
+                <span>Alpha</span>
+                <input id="point-opacity" type="range" min="0.15" max="1" step="0.05" value="0.95">
+              </label>
+              <label class="compact-field">
+                <span>Budget</span>
+                <select id="point-budget">
+                  <option value="8000">8k</option>
+                  <option value="16000" selected>16k</option>
+                  <option value="32000">32k</option>
+                  <option value="60000">60k</option>
+                </select>
+              </label>
+              <button id="top-view" title="Top-down view">Top</button>
+              <button id="rover-view" title="Center on rover">Rover</button>
+            </div>
+          </div>
+          <div class="viewer-wrap">
+            <div id="cloud-notice" class="cloud-notice" role="status" aria-live="polite" hidden></div>
+            <canvas id="viewer-canvas"></canvas>
+            <div class="viewer-hud">
+              <span id="viewer-count">0 pts</span>
+              <span id="viewer-frame"></span>
+            </div>
+          </div>
+          <div id="topic-strip" class="topic-strip"></div>
+        </section>
+
+        <aside class="panel right-panel">
+          <section class="side-section media-section">
+            <div class="section-head image-section-head">
+              <h2>Images</h2>
+              <div class="image-head-tools">
+                <label class="inline-toggle" title="Subscribe directly to raw/compressed camera and depth topics">
+                  <input id="camera-streams-toggle" type="checkbox">
+                  <span>Streams</span>
+                </label>
+                <button id="image-large-toggle" class="image-mode-button" type="button" title="Expand the Images panel over the dashboard">Large</button>
+                <button id="image-fullscreen-toggle" class="image-mode-button" type="button" title="Show the Images panel in browser fullscreen">Full Screen</button>
+              </div>
+              <div id="image-tabs" class="mini-tabs" aria-label="Camera views"></div>
+              <div id="image-caption" hidden></div>
+            </div>
+            <div class="image-frame">
+              <img id="live-image" alt="" title="Click to select the DINO/CLIP similarity location">
+              <div id="similarity-marker" aria-hidden="true"></div>
+              <div id="image-empty" class="empty-state">waiting for image</div>
+              <div id="image-health" role="status" hidden></div>
+            </div>
+          </section>
+
+          <section class="side-section grid-section">
+            <div class="section-head">
+              <h2>2D Maps</h2>
+              <div id="grid-tabs" class="mini-tabs"></div>
+            </div>
+            <div class="grid-frame">
+              <img id="grid-image" alt="">
+              <div id="grid-empty" class="empty-state">waiting for grid</div>
+            </div>
+          </section>
+
+          <section class="side-section graph-section">
+            <div class="section-head">
+              <h2>Graph</h2>
+              <div class="graph-counts">
+                <span id="graph-node-count">0 nodes</span>
+                <span id="graph-edge-count">0 edges</span>
+              </div>
+            </div>
+            <div id="graph-list" class="graph-list"></div>
+          </section>
+
+          <section class="side-section event-section">
+            <div class="section-head">
+              <h2>Events</h2>
+            </div>
+            <div id="event-log" class="event-log"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

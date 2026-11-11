@@ -1,0 +1,17 @@
+.runtime/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.venv/
+.env
+.env.*
+!.env.example
+# Model artifacts are installed separately; keep them local.
+weights/
+*.pt
+*.pth
+*.safetensors
+*.onnx

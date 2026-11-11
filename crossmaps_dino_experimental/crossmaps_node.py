@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# crossmaps_3_node.py
+"""CrossMaps v2: RGB-D perception, persistent surfaces and entity hypotheses."""
 import hashlib
 import json
 import os
@@ -264,9 +264,9 @@ def maximum_weight_assignment(scores: np.ndarray) -> List[Tuple[int, int]]:
 # -----------------------------
 # node
 # -----------------------------
-class CrossMaps3Node(Node):
+class CrossMapsNode(Node):
     """
-    CrossMaps v3:
+    CrossMaps v2:
     - Features:
         * internal_frame storage, publish_frame publishing
         * Multi-level confidence: point confidence + cell confidence
@@ -1124,7 +1124,7 @@ class CrossMaps3Node(Node):
         if bool(self.get_parameter("use_async_semantic_worker").value):
             self.start_async_semantic_worker()
 
-        self.get_logger().info("CrossMaps v3 node started (STM + LTM, with save/load support).")
+        self.get_logger().info("CrossMaps v2 node started (surface memory, entity grouping, STM + LTM).")
         self.get_logger().info(f"internal_frame={self.internal_frame}, publish_frame={self.publish_frame}")
         self.get_logger().info(
             "Publishes: "
@@ -9524,7 +9524,7 @@ def main():
             probe.destroy_node()
         node = None
         try:
-            node = CrossMaps3Node()
+            node = CrossMapsNode()
             rclpy.spin(node)
         except KeyboardInterrupt:
             pass

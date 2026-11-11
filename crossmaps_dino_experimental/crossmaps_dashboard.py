@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Browser dashboard for CrossMaps.
+"""Browser dashboard for CrossMaps v2.
 
 This runs as a separate ROS 2 node. It subscribes to CrossMaps visualization
 topics, exposes a small HTTP API, serves the static dashboard UI, and writes
@@ -1929,7 +1929,7 @@ def make_handler(dashboard: CrossMapsDashboard):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="CrossMaps browser dashboard")
+    parser = argparse.ArgumentParser(description="CrossMaps v2 browser dashboard")
     parser.add_argument("--target-node", default="/crossmaps_3_node", help="CrossMaps ROS node name")
     parser.add_argument("--host", default="127.0.0.1", help="HTTP bind address")
     parser.add_argument("--port", default=8765, type=int, help="HTTP port, use 0 for an ephemeral port")

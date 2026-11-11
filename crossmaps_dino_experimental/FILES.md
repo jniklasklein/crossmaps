@@ -1,6 +1,6 @@
-# Current implementation inventory
+# CrossMaps v2 — File Inventory
 
-This is the experimental DINO/CLIP world-model version with separate surface
+This is the CrossMaps v2 DINO/CLIP world-model pipeline with separate surface
 segments, reversible entity groups, stable dominant camera overlays, and bounded
 neighborhood tie-breaking. The sofa grouping was reported working in live use;
 this is not a general accuracy or mobile-localization guarantee.
@@ -9,7 +9,7 @@ this is not a general accuracy or mobile-localization guarantee.
 
 | File | Purpose |
 | --- | --- |
-| `crossmaps_3_node_3d_revised-exp.py` | Perception entry point: RGB-D transport, eSAM/CLIP/DINO inference, fusion, ROS publications. |
+| `crossmaps_node.py` | Perception entry point: RGB-D transport, eSAM/CLIP/DINO inference, fusion, ROS publications. |
 | `identity_graph.py` | Persistent entity membership, near-tie evidence, and temporal graph relations. |
 | `object_assembly.py` | Reversible DINO/contact grouping of established parts; retains separate segments. |
 | `surface_tracking.py` | Temporal surface consensus and bounded ownership corrections. |
@@ -48,19 +48,24 @@ Use the existing ROS 2 environment with the dependencies below available.
 From the repository root, in separate terminals:
 
 ```sh
-python3 crossmaps_dino_experimental/crossmaps_3_node_3d_revised-exp.py
+python3 crossmaps_dino_experimental/crossmaps_node.py
 ```
 
 ```sh
 python3 crossmaps_dino_experimental/crossmaps_dashboard.py
 ```
 
-Open `http://127.0.0.1:8765`. Start only one experimental perception process.
+Open `http://127.0.0.1:8765`. Start only one CrossMaps perception process.
 The robot's camera, depth, camera-info and TF publishers must already be running.
 Defaults retain eSAM `vitt`, CLIP `ViT-L-14`/`openai`, DINOv2 `vits14`, compressed
 RGB/depth transport, and **stationary pose lock off**. Default map autoload and
 autosave are off. Robot-side sources and launch configuration are not part of
 this snapshot.
+
+The branch is `crossmaps-v2`. The existing `crossmaps_dino_experimental/`
+directory, ROS node name `/crossmaps_3_node`, topics, and stored-map schema
+identifiers are deliberately retained for compatibility. The renamed entry
+point does not move or delete local data. See README.md for naming details.
 
 ## External prerequisites, not repository source
 
@@ -87,7 +92,7 @@ packages and model files have not been moved, deleted or bundled into Git.
   `~/.crossmaps/crossmaps_dashboard_presets.json`; it is external to this folder.
   A source checkout alone does not reproduce arbitrary unsaved live parameters.
 - Other experimental directories and unrelated root-level work remain local
-  and are not included in this experimental snapshot commit.
+  and are not included in the CrossMaps v2 source snapshot commit.
 
 ## Verification
 

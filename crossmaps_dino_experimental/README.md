@@ -1,12 +1,16 @@
-# CrossMaps DINO Experimental
+# CrossMaps v2
+
+An RGB-D world-model pipeline with persistent surface segments, reversible
+object-entity grouping, open-vocabulary semantics, and a live inspection dashboard.
+
+Development branch: **`crossmaps-v2`**.
 
 For the maintained file inventory, launch commands, external dependencies, and
 what is intentionally kept local, see [FILES.md](FILES.md). This directory is
 the current implementation; similarly named scripts and backup directories at
 the repository root are not used by it.
 
-This directory contains the isolated experimental CrossMaps rework. The ROS
-node combines four deliberately separate signals:
+The perception node combines four deliberately separate signals:
 
 - EfficientSAM: per-frame mask proposals
 - DINOv2: instance appearance and cross-view correspondence
@@ -16,9 +20,41 @@ node combines four deliberately separate signals:
 DINO and CLIP descriptors are never averaged together. A segment keeps a CLIP
 semantic memory and an independent DINO appearance memory.
 
+## Quick start
+
+From the repository root, with the ROS 2/model environment active, run these
+in separate terminals:
+
+```sh
+python3 crossmaps_dino_experimental/crossmaps_node.py
+```
+
+```sh
+python3 crossmaps_dino_experimental/crossmaps_dashboard.py
+```
+
+Open **http://127.0.0.1:8765**. The robot's RGB-D camera and TF publishers must
+already be running. Start only one perception node. External dependencies and
+weight locations are listed in [FILES.md](FILES.md).
+
+### Naming and compatibility
+
+`crossmaps_node.py` is the maintained perception entry point. The dashboard
+entry point remains `crossmaps_dashboard.py`; helper modules use descriptive
+names such as `identity_graph.py` and `dominant_overlay.py`.
+
+The directory name `crossmaps_dino_experimental/` is retained for path
+compatibility: local `.runtime/` maps, logs, model-weight lookup, and existing
+workspace references stay in place. The ROS node name `/crossmaps_3_node`,
+`/crossmaps/...` topics, source IDs and serialized schema versions also remain
+unchanged. Those compatibility identifiers are not the product version.
+Update launch commands to use `crossmaps_node.py`; the old dated entry-point
+filename is no longer used. This naming cleanup changes no inference defaults
+or association behavior, and does not claim that upstream yaw drift is solved.
+
 ## Runtime defaults
 
-The experimental defaults retain the existing MacBook inference setup:
+The defaults retain the existing MacBook inference setup:
 
 - one aspect-preserving `dinov2_vits14` full-frame pass at 518 px
 - `ViT-L-14` CLIP for the stronger open-vocabulary semantic representation
@@ -48,12 +84,11 @@ robot, point `dinov2_local_repo` at a local DINOv2 checkout and optionally set
 `dinov2_checkpoint`. If DINO cannot initialize or infer, the node continues
 with CLIP and geometry.
 
-## Persistent identity rework
+## Persistent identity and object grouping
 
 `identity_graph.py` owns observation-driven entity memory, independently of ROS,
-the neural models, and visualization. Keep `identity_graph.py`,
-`object_assembly.py`, `surface_tracking.py`, `segment_overlay.py`, and
-`world_model.py` beside the node when launching.
+the neural models, and visualization. Keep all nine runtime helper modules
+listed in [FILES.md](FILES.md) beside the node when launching.
 
 - **Surface segments** retain their own geometry and CLIP/DINO descriptors.
   A small, strongly reprojected mask can update a larger existing surface;
@@ -413,7 +448,7 @@ For a reliable wired link, raw inputs remain available by explicitly setting all
 four parameters at startup:
 
 ```sh
-python3 crossmaps_3_node_3d_revised-exp.py --ros-args \
+python3 crossmaps_node.py --ros-args \
   -p rgb_topic:=/oak/rgb/image_rect -p rgb_compressed:=false \
   -p depth_topic:=/oak/stereo/image_raw -p depth_compressed:=false
 ```

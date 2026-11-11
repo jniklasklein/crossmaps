@@ -1,4 +1,4 @@
-"""Prevent two local experimental pipelines from publishing conflicting maps."""
+"""Prevent two local CrossMaps pipelines from publishing conflicting maps."""
 import fcntl
 import os
 from pathlib import Path
@@ -17,7 +17,7 @@ class PipelineInstance:
         except BlockingIOError:
             stream.seek(0);owner=stream.read().strip()
             stream.close()
-            raise RuntimeError('Another experimental perception process already owns this pipeline '
+            raise RuntimeError('Another CrossMaps perception process already owns this pipeline '
                                f'(PID {owner or "unknown"}). Stop it before starting a replacement.') from None
         stream.seek(0);stream.truncate();stream.write(str(os.getpid()));stream.flush()
         self.stream=stream

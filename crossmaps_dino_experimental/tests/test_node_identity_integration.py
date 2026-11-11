@@ -33,9 +33,9 @@ from voxel_scoring import score_voxels
 from identity_graph import IdentityConfig, ObservationEdges, PersistentEntities
 
 
-NODE_PATH = Path(__file__).resolve().parents[1] / "crossmaps_3_node_3d_revised-exp.py"
+NODE_PATH = Path(__file__).resolve().parents[1] / "crossmaps_node.py"
 TREE = ast.parse(NODE_PATH.read_text())
-CLASS = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "CrossMaps3Node")
+CLASS = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "CrossMapsNode")
 DEFAULTS = {}
 for statement in ast.walk(next(n for n in CLASS.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")):
     if isinstance(statement, ast.Call) and isinstance(statement.func, ast.Attribute) and statement.func.attr == "declare_parameter":
@@ -66,7 +66,7 @@ exec(compile(ast.fix_missing_locations(MODULE), str(NODE_PATH), "exec"), NAMESPA
 
 
 def make_node():
-    node = NAMESPACE["CrossMaps3Node"]()
+    node = NAMESPACE["CrossMapsNode"]()
     node.params = dict(DEFAULTS)
     node.params.update(publish_semantic_cloud=False, use_ray_consistency=False,
                        segment_track_debug_log=False, segment_maintenance_debug_log=False,
@@ -786,7 +786,7 @@ class NodeIntegrationTests(unittest.TestCase):
         node.debug_rgb_image_has_subscribers = lambda *_: True
         captured = []
         node.publish_debug_rgb_image = lambda raw, compressed, rgb, header, **kwargs: captured.append(rgb)
-        NAMESPACE["CrossMaps3Node"].publish_entity_id_projection(node)
+        NAMESPACE["CrossMapsNode"].publish_entity_id_projection(node)
         pixels = captured[0][0]
         self.assertEqual(tuple(pixels[0]), (0, 0, 0))
         self.assertEqual(tuple(pixels[1]), node._segment_instance_rgb(1))

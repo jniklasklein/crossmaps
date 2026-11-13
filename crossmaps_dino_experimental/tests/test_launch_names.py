@@ -14,7 +14,16 @@ class LaunchNamingTests(unittest.TestCase):
                          and isinstance(n.func, ast.Attribute) and n.func.attr == '__init__'
                          and isinstance(n.func.value, ast.Call)
                          and isinstance(n.func.value.func, ast.Name) and n.func.value.func.id == 'super')
-        name = ast.literal_eval(base_init.args[0])
+        name_arg = base_init.args[0]
+        if isinstance(name_arg, ast.Name):
+            # Collaborative callers override the node name, but standalone v2
+            # must retain its public default and the dashboard target.
+            defaults = dict(zip([a.arg for a in init.args.args][-len(init.args.defaults):],
+                                init.args.defaults))
+            defaults.update({a.arg: v for a, v in zip(init.args.kwonlyargs, init.args.kw_defaults)
+                             if v is not None})
+            name_arg = defaults[name_arg.id]
+        name = ast.literal_eval(name_arg)
         self.assertEqual(name, 'crossmaps_v2_node')
         dashboard = ast.parse((root / 'crossmaps_dashboard.py').read_text())
         target = next(n for n in ast.walk(dashboard) if isinstance(n, ast.Call)

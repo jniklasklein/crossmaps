@@ -1,0 +1,34 @@
+{
+  "central_domain": 42,
+  "dashboard": {"host": "127.0.0.1", "port": 8766},
+  "input": {"max_hz": 2.0, "max_age_s": 2.0, "sync_slop_s": 0.08},
+  "backend": {"shadow_mode": true},
+  "pose_guard": {"enabled": true},
+  "perception": {
+    "parameters": {
+      "esam_variant": "vitt",
+      "clip_model_name": "ViT-L-14",
+      "clip_pretrained": "openai",
+      "dinov2_model_name": "dinov2_vits14",
+      "stationary_pose_lock": false
+    }
+  },
+  "robots": [
+    {
+      "id": "rover_a", "domain": 0, "local_frame": "odom",
+      "rgb_topic": "/oak/rgb/image_rect/compressed",
+      "depth_topic": "/oak/stereo/image_raw/compressedDepth",
+      "camera_info_topic": "/oak/rgb/camera_info",
+      "depth_camera_info_topic": "/oak/stereo/camera_info",
+      "depth_registration": "auto"
+    },
+    {
+      "id": "rover_b", "domain": 1, "local_frame": "odom",
+      "rgb_topic": "/oak/rgb/image_rect/compressed",
+      "depth_topic": "/oak/stereo/image_raw/compressedDepth",
+      "camera_info_topic": "/oak/rgb/camera_info",
+      "depth_camera_info_topic": "/oak/stereo/camera_info",
+      "depth_registration": "auto"
+    }
+  ]
+}

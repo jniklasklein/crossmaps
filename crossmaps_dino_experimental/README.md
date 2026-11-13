@@ -1,9 +1,35 @@
-# CrossMaps v2
+# CrossMaps — collaborative experiment and v2 foundation
+
+The new two-rover experiment is on **`experimental/crossmaps-collaborative`**.
+It runs both source domains through isolated input adapters, shares one set of
+neural models, keeps source-owned map evidence, and includes its own collaborative
+dashboard. See [COLLABORATIVE.md](COLLABORATIVE.md) for architecture, calibration,
+alignment workflows, recording/resume and limitations.
+
+From the repository root in the existing `ros_humble_env` environment:
+
+```sh
+python3 crossmaps_dino_experimental/crossmaps_collaborative.py --check
+python3 crossmaps_dino_experimental/crossmaps_collaborative.py
+```
+
+Open **http://127.0.0.1:8766**. The default inputs are rover A/domain 0 and rover
+B/domain 1; the central diagnostic domain is 42. No separate dashboard process is
+needed. Start the rover publishers first; stop old local perception runs so that
+models are not duplicated. `--demo` runs a clearly synthetic no-robot test.
+
+Automatic cross-rover alignment starts in **shadow mode**. Inspect verified
+candidates or supply a measured anchor before interpreting a combined map.
+Nothing in this experiment changes the robot's localization or fixes upstream
+yaw drift. The code below remains the single-rover foundation, not the launch
+procedure for two rovers.
+
+## Single-rover v2 foundation
 
 An RGB-D world-model pipeline with persistent surface segments, reversible
 object-entity grouping, open-vocabulary semantics, and a live inspection dashboard.
 
-Development branch: **`crossmaps-v2`**.
+The single-rover baseline is maintained on **`crossmaps-v2`** and retained here.
 
 For the maintained file inventory, launch commands, external dependencies, and
 what is intentionally kept local, see [FILES.md](FILES.md). This directory is
@@ -20,7 +46,7 @@ The perception node combines four deliberately separate signals:
 DINO and CLIP descriptors are never averaged together. A segment keeps a CLIP
 semantic memory and an independent DINO appearance memory.
 
-## Quick start
+## Single-rover quick start
 
 From the repository root, with the ROS 2/model environment active, run these
 in separate terminals:

@@ -1,11 +1,52 @@
-# CrossMaps v2 — File Inventory
+# CrossMaps — collaborative and v2 file inventory
+
+The two-rover experimental branch is **`experimental/crossmaps-collaborative`**.
+Its complete startup and operating guide is [COLLABORATIVE.md](COLLABORATIVE.md).
+
+## Collaborative entry point and modules
+
+| File | Purpose |
+| --- | --- |
+| `crossmaps_collaborative.py` | One-command coordinator, input process lifecycle, shared inference scheduling, built-in dashboard, checkpoints. |
+| `config/collaborative_two_rovers.json` | Two-rover defaults: input domains 0/1, central domain 42, dashboard port 8766, shadow mode. |
+| `collab_config.py` | Configuration validation and experimental-owned run directories. |
+| `collab_transport.py` | Read-only per-domain ROS input adapters, isolated TF, compressed RGB-D decoding and calibrated depth registration. |
+| `collab_runtime.py` | Fair bounded latest-frame scheduling and completed-cycle timing. |
+| `collab_perception.py` | Shared model objects with separate source/session v2 memories; pose contradiction guard and observation evidence extraction. |
+| `collab_backend.py` | Keyframes/submaps, candidate retrieval, source/session provenance, pose constraints, reversible global identity links and persistence. |
+| `collab_geometry.py` | RGB-D correspondence verification, robust fitting, ICP, geometry checks and bounded sparse keyframe pose-graph optimization. |
+| `collab_dashboard.py` | Loopback HTTP server, protected command API, source camera endpoints and static asset allowlist. |
+| `collab_dashboard/index.html` | Collaborative dashboard layout and alignment controls. |
+| `collab_dashboard/app.js` | Per-rover camera/health views, source-local/combined WebGL map and evidence review. |
+| `collab_dashboard/styles.css` | Responsive, uncropped camera and map presentation. |
+| `collab_demo.py` | Synthetic observations for no-robot integration/demo runs; not a learned-perception accuracy test. |
+| `COLLABORATIVE.md` | Two-rover architecture, startup, configuration, evidence workflow and limitations. |
+
+The collaborative perception wrapper also imports the v2 entry point and helper
+modules listed below. Keep both sets together. No sibling backup directory is
+used, and no duplicate model-loaded ROS perception nodes need to be launched.
+
+From the repository root with the existing ROS/model environment active:
+
+```sh
+python3 crossmaps_dino_experimental/crossmaps_collaborative.py --check
+python3 crossmaps_dino_experimental/crossmaps_collaborative.py
+```
+
+Open `http://127.0.0.1:8766`. The server includes the dashboard. Generated evidence,
+recorded configuration and logs live under `.runtime/collaboration/` and stay
+local/ignored. `--demo` requires NumPy/OpenCV but no ROS or model initialization.
+`--replay RUN_DIR` inspects a retained run without ROS/models or writing the source
+recording; decisions in that dashboard are in-memory only.
+
+## Single-rover v2 foundation
 
 This is the CrossMaps v2 DINO/CLIP world-model pipeline with separate surface
 segments, reversible entity groups, stable dominant camera overlays, and bounded
 neighborhood tie-breaking. The sofa grouping was reported working in live use;
 this is not a general accuracy or mobile-localization guarantee.
 
-## Files used by the running system
+## Files used by the single-rover foundation
 
 | File | Purpose |
 | --- | --- |
@@ -42,7 +83,7 @@ root-level perception script, or root-level dashboard is imported by this versio
   localization issues. Referenced local recordings are not shipped.
 - `.gitignore`: excludes generated runtime data, caches and model artifacts.
 
-## Start the current version
+## Start the single-rover version
 
 Use the existing ROS 2 environment with the dependencies below available.
 From the repository root, in separate terminals:
@@ -64,7 +105,7 @@ RGB/depth transport, and **stationary pose lock off**. Default map autoload and
 autosave are off. Robot-side sources and launch configuration are not part of
 this snapshot.
 
-The branch is `crossmaps-v2`. The existing `crossmaps_dino_experimental/`
+The single-rover baseline branch is `crossmaps-v2`. The existing `crossmaps_dino_experimental/`
 directory, topics, and stored-map schema identifiers are deliberately retained
 for compatibility. The ROS node is `/crossmaps_v2_node`, and the dashboard's
 default target matches it. The renamed entry
@@ -90,6 +131,8 @@ packages and model files have not been moved, deleted or bundled into Git.
 ## Kept local
 
 - `.runtime/`: maps/checkpoints, screenshots, recordings, logs and lock files.
+- `.runtime/collaboration/`: independent collaborative run configurations,
+  keyframe evidence, graph decisions and ROS logs; not copied into Git.
 - Python caches, OS metadata and any model binaries.
 - The dashboard's default preset file is
   `~/.crossmaps/crossmaps_dashboard_presets.json`; it is external to this folder.
@@ -107,6 +150,8 @@ node tests/test_dashboard_identity.cjs
 node tests/test_dashboard_cloud_controls.cjs
 node tests/test_dashboard_image_health.cjs
 node --check crossmaps_dashboard/app.js
+node tests/test_collab_dashboard.cjs
+node --check collab_dashboard/app.js
 python3 -B replay_identity.py --demo
 ```
 

@@ -297,8 +297,12 @@ class CrossMapsNode(Node):
         * /crossmaps/history_cloud
     """
 
-    def __init__(self):
-        super().__init__("crossmaps_v2_node")
+    def __init__(self, *, node_name="crossmaps_v2_node", context=None,
+                 parameter_overrides=None, external_inputs=False, shared_models=None):
+        # Fleet mode supplies already synchronized, calibrated observations.
+        # Keep the standalone constructor/default behavior unchanged.
+        super().__init__(node_name, context=context, parameter_overrides=parameter_overrides)
+        self.external_inputs = bool(external_inputs)
         self.bridge = CvBridge()
         self.frame_counter = 0
         self.publish_counter = 0
@@ -937,7 +941,7 @@ class CrossMapsNode(Node):
 
         # TF
         self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.tf_listener = None if self.external_inputs else tf2_ros.TransformListener(self.tf_buffer, self)
 
         # CLIP
         #self.device = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -952,17 +956,26 @@ class CrossMapsNode(Node):
         # MODEL SELECTION -> ViT-B-32 is faster but less accurate, ViT-L-14 is slower but better
         model_name = str(self.get_parameter("clip_model_name").value)
         pretrained = str(self.get_parameter("clip_pretrained").value)
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-            model_name=model_name, pretrained=pretrained
-        )
-        self.tokenizer = open_clip.get_tokenizer(model_name)
-        self.model.eval()
-        self.model.to(self.device)
+        if shared_models is None:
+            self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+                model_name=model_name, pretrained=pretrained
+            )
+            self.tokenizer = open_clip.get_tokenizer(model_name)
+            self.model.eval()
+            self.model.to(self.device)
+        else:
+            self.model = shared_models["model"]
+            self.preprocess = shared_models["preprocess"]
+            self.tokenizer = shared_models["tokenizer"]
+            self.device = shared_models["device"]
+            self.inference_lock = shared_models["inference_lock"]
 
         # EfficientSAM
         self.esam_model = None
         self.esam_unavailable_warned = False
-        if bool(self.get_parameter("use_esam_masks").value):
+        if shared_models is not None:
+            self.esam_model = shared_models["esam_model"]
+        elif bool(self.get_parameter("use_esam_masks").value):
             self.init_esam()
 
         # DINOv2 appearance model. Initialization failure is non-fatal: CLIP
@@ -970,7 +983,10 @@ class CrossMapsNode(Node):
         self.dinov2_model = None
         self.dinov2_unavailable_warned = False
         self.dinov2_patch_size = 14
-        if bool(self.get_parameter("use_dinov2_features").value):
+        if shared_models is not None:
+            self.dinov2_model = shared_models["dinov2_model"]
+            self.dinov2_patch_size = shared_models["dinov2_patch_size"]
+        elif bool(self.get_parameter("use_dinov2_features").value):
             self.init_dinov2()
 
         # query embedding cache
@@ -1060,7 +1076,7 @@ class CrossMapsNode(Node):
         self.pub_obj_instance_voxels = self.create_publisher(PointCloud2, "/crossmaps/objects/instance_voxels", 1)
         self.pub_segment_voxels = self.create_publisher(PointCloud2, "/crossmaps/segments/voxels", 1)
         self.pub_entity_voxels = self.create_publisher(PointCloud2, "/crossmaps/entities/voxels", 1)
-        self.entity_correction_sub = self.create_subscription(
+        self.entity_correction_sub = None if self.external_inputs else self.create_subscription(
             String, "/crossmaps/entities/corrections", self.on_entity_correction, 10
         )
         self.pub_obj_unassigned_query_voxels = self.create_publisher(
@@ -1076,6 +1092,14 @@ class CrossMapsNode(Node):
         self.pub_voxel_stm_heatmap = self.create_publisher(PointCloud2, "/crossmaps/voxels/stm_heatmap", 1)
         self.pub_voxel_ltm_heatmap = self.create_publisher(PointCloud2, "/crossmaps/voxels/ltm_heatmap", 1)
         self.pub_voxel_fused_heatmap = self.create_publisher(PointCloud2, "/crossmaps/voxels/fused_heatmap", 1)
+
+        if self.external_inputs:
+            # No independent timers/workers: the fleet scheduler serializes
+            # model inference and mutations to each rover's local map.
+            self.timer = self.autosave_timer = None
+            self.observation_timer = self.pipeline_health_timer = None
+            self.get_logger().info("CrossMaps collaborative external-input perception ready.")
+            return
 
         self.timer = self.create_timer(1.0 / float(self.get_parameter("publish_hz").value), self.on_publish)
         self.autosave_timer = self.create_timer(
@@ -5027,6 +5051,10 @@ class CrossMapsNode(Node):
                     stats["projected_matched"] += 1
 
         stats["unique_frame_sids"] = int(len(frame_sids))
+        # Collaborative evidence exports only support accepted in this cycle,
+        # never historical projected owners or display-only dominant filling.
+        if getattr(self, "external_inputs", False):
+            self.last_observation_point_segments = accepted_point_sid.copy()
         # Display current visible owners even if SAM missed them or appearance
         # gating prevented a descriptor update. This is not a fused observation.
         visible_sids = {int(s) for s in point_sids if int(s) in self.seg_w}
@@ -6886,7 +6914,8 @@ class CrossMapsNode(Node):
         dense_dino = result.get("dense_dino", None)
         self.current_assignment_dino = dense_dino
         rgb_cv = result["rgb_cv"]
-        self.last_assignment_rgb = cv2.cvtColor(rgb_cv, cv2.COLOR_BGR2RGB)
+        self.last_assignment_rgb = (rgb_cv.copy() if getattr(self, "external_inputs", False)
+                                    else cv2.cvtColor(rgb_cv, cv2.COLOR_BGR2RGB))
         self.last_mask_attribution = []
         self.last_visible_segment_counts = {}
         rgb_header = result["rgb_header"]
@@ -6895,6 +6924,8 @@ class CrossMapsNode(Node):
             if features.ndim == 3:
                 self.dino_base_dim = int(features.shape[-1])
         pts_int = result["pts_int"]
+        if getattr(self, "external_inputs", False):
+            self.last_observation_point_segments = np.zeros(len(pts_int), dtype=np.int32)
         cam_int = result["cam_int"]
         uu = result["uu"]
         vv = result["vv"]

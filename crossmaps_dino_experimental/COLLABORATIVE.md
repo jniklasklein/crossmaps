@@ -14,6 +14,12 @@ It never publishes movement commands or changes either rover's TF tree.
 
 On each rover, start its existing camera, depth, calibration, odometry and TF
 publishers as usual. Rover A must use ROS domain **0**, and rover B domain **1**.
+The Jetsons' normal SLAM launch includes sensor recovery. For a stalled feed,
+use the [rover-side health check](rover_recovery/README.md) before restarting
+SLAM; it distinguishes a live publisher from a sensor actually producing data.
+For a rotating map with fresh sensors, see the [odometry patch and parked/turn
+checks](rover_odometry/README.md). The diagnostic RF2O heading is not the
+authoritative mapping pose on a rover with that patch enabled.
 The laptop must be able to discover both domains over the network. Use the
 existing ROS/model environment on the laptop:
 
@@ -47,9 +53,13 @@ model weights are available. Initial model loading may take time.
 2. Inspect **Rover A** and **Rover B** separately in the spatial viewer. Combined
    deliberately excludes unaligned submaps. The first observed source session
    defines the shared coordinate reference; no GPS/global origin is implied.
-3. Put both cameras where they observe a distinctive overlapping scene. Small,
-   genuinely different viewpoints are useful; repeatedly processing an unchanged
-   frame does not establish independent corroboration.
+3. Point both cameras at a common textured scene with details at several depths.
+   For a first trial, start with similar headings and wait for a verified match.
+   Leave one rover in place, move the other about 20–30 cm while keeping those
+   details visible, then pause. Check that **Last map integration** updates and a
+   new keyframe appears. Automatic alignment needs two geometrically consistent
+   matches, with a genuine viewpoint change on at least one rover. Repeated
+   observations from the same two positions provide only one viewpoint pair.
 4. Leave **Shadow mode on** initially. It retrieves candidates and computes
    registration evidence without automatically accepting alignments or identity
    links. Inspect inliers, overlap, residuals and rejection reasons. A verified
@@ -61,10 +71,9 @@ model weights are available. Initial model loading may take time.
 6. Inspect shared-entity proposals only after alignment is credible. Their
    membership remains reversible; source segment/entity IDs are not overwritten.
 
-Turning Shadow mode off enables automatic acceptance of future corroborated,
-non-conflicting evidence. It does not retroactively accept all historical
-proposals. Start with controlled scenes, not repeated identical boxes or a map
-already visibly distorted by bad odometry.
+Turning Shadow mode off allows automatic acceptance once cross-rover evidence
+is corroborated. Existing eligible entity links can activate when the coordinator
+re-evaluates them. Local mapping and camera previews run in either mode.
 
 ## Configuration
 
@@ -90,6 +99,7 @@ setup. Missing settings inherit validated defaults from `collab_config.py`.
 | `input.sync_slop_s` | `0.08`; maximum paired RGB/depth timestamp skew |
 | `backend.shadow_mode` | `true`; automatic cross-source acceptance disabled initially |
 | `pose_guard.enabled` | `true`; pauses integration on a supported pose contradiction |
+| `pose_guard.rgbd_recovery` | `true`; allows a local mapping pose to be recovered from a previously observed RGB-D view after repeated geometric and image agreement |
 | `perception.parameters` | Shared v2 model/processing defaults; robot-specific non-model settings can use `robots[].parameters` |
 
 The model defaults remain **eSAM ViT-T**, **CLIP ViT-L-14 / OpenAI**, and
@@ -102,9 +112,9 @@ in collaborative mode.
 
 ### Timestamp and calibration requirements
 
-- Synchronize laptop and rover wall clocks. The adapter compares sensor stamps
-  with its clock and rejects stale/future packets beyond `input.max_age_s`.
-  Increasing that limit is not a substitute for fixing clock skew.
+- Keep laptop and rover clocks synchronized. The adapter checks a paired
+  depth frame's age on arrival and tracks time spent waiting for TF separately.
+  Network delivery and sensor buffering also contribute to age on arrival.
 - RGB/depth pairs and TF must use a consistent clock. TF is looked up at the
   observation timestamp. The adapter waits briefly for valid data; it does not
   substitute an arbitrary latest transform.
@@ -150,7 +160,15 @@ The input processes subscribe only to their own source domains. Topic names and
 TF frame IDs may be identical on both rovers because their TF buffers never mix.
 The coordinator processes sources fairly with at most one pending observation
 per rover. Older pending observations are replaced instead of accumulating an
-unbounded inference backlog. RGB preview is independent of model completion.
+unbounded inference backlog. RGB and depth previews use the compressed camera
+streams and update independently of model completion. The depth preview uses
+the camera's depth grid. Mapping uses depth registered to RGB.
+If compressed RGB stops advancing for 12 seconds while valid depth still
+advances, the laptop adapter replaces just its RGB reader, clears stale pair
+queues, and retries at most once per 30 seconds. The last image keeps its
+original age until a fresh source timestamp arrives. This does not restart
+the rover, switch to raw images, or reset the source session. A persistent
+outage still warrants checking on-rover publication and wireless delivery.
 One serialized inference worker shares model objects; local v2 segmentation,
 ownership and entity state are separate for each source/session.
 
@@ -161,6 +179,30 @@ Verification uses distinctive mutual visual correspondences, depth-backed robust
 rigid fitting, bounded ICP, spatial support and overlap checks. Appearance alone
 never establishes a shared pose. Candidate transforms, supporting observations,
 acceptance state and provenance remain inspectable.
+
+ORB is the inexpensive first pass. When it cannot initialize a pose, the
+verifier proposes spatially distributed mutual RootSIFT/AKAZE features and
+uses calibrated depth (including two-direction PnP when depth has holes).
+The fallback checks held-out image matches and original, mutually visible
+depth in both directions. ICP can veto a pose, but cannot slide the returned
+pose along a wall to improve its residual at the expense of image alignment.
+The dashboard distinguishes retrieval, visual matches, geometric verification,
+and activation; a second pose-supported view is still required for automatic
+corroboration. If two verification slots are available, one may test a
+recent frame from the other rover rather than another old lookalike.
+
+To compare ORB with the current verifier without touching the live run:
+
+```sh
+python3 crossmaps_dino_experimental/replay_alignment.py \
+  crossmaps_dino_experimental/.runtime/collaboration/RUN --selection nearest --limit 12
+```
+
+Replace `RUN` with the recorded run directory. Use `--selection checked`
+to inspect previously checked pairs, or repeat `--pair SOURCE_ID:TARGET_ID`
+for a fixed comparison. The replay reports failed stages, verified camera
+poses in a common direction, and deliberately mismatched controls. Agreement
+across stationary frames is not a physical accuracy measurement or a map merge.
 
 All retained keyframes participate in the pose graph. Conservatively weighted
 within-source odometry edges preserve temporal structure; accepted RGB-D matches
@@ -278,18 +320,22 @@ and can use a separate dashboard port while another run is active.
 | Symptom | Check |
 | --- | --- |
 | One or both rover cards receive nothing | Domain IDs, reachable DDS discovery, active camera topics, ROS environment and network/firewall settings |
-| RGB visible but map/overlays missing | Input rejection reason; CameraInfo, depth, timestamps and observation-time TF can fail even when RGB preview works |
-| `sensor clock skew/staleness` | Synchronize laptop/rover clocks; inspect whether sensor stamps advance |
-| `waiting_for_tf` / expired pair | The configured local frame must have a valid transform to the camera at the image stamp |
+| RGB and depth visible but SAM, DINO or CLIP missing | Check pairing, calibration, depth registration and the model worker. These views require a calibrated RGB-D observation. |
+| Frame already old on arrival | Compare sensor stamps, host clocks and delivery delay. |
+| Waiting for odometry TF or inconsistent visual pose | SAM, DINO and CLIP can update from registered RGB-D. Segments and Entities retain the last mapped overlays until a frame passes pose validation. |
 | Depth registration rejected | Check true optical frames, matching CameraInfo and calibrated depth-to-RGB transform; do not resize depth or guess extrinsics |
-| RGB live, processed age grows | Model initialization, processing error, pose guard, or inference throughput; inspect terminal and per-rover status |
+| RGB live, processed age grows | Check incoming RGB-D pairs, model initialization and inference throughput. Each feed carries its own image age. |
 | B absent from Combined | Expected until its source/session is connected by an accepted verified constraint or supplied anchor |
 | No shared identities after an anchor | Alignment alone does not prove object identity; inspect proposals, geometry/appearance and distinct viewpoints |
 | `visual_odometry_contradiction` / `pose_rejected` | Measured scene evidence disagrees with supplied odometry; integration pauses rather than smearing geometry |
 | Already-running/port error | Stop the previous coordinator normally or choose a different port and nonconflicting central domain for an intentionally separate run |
 
-The pose-consistency guard is **not a stationary lock, visual odometry, or a yaw
-drift fix**. Upstream RF2O/base heading issues remain relevant. Accepted visual
+When odometry disagrees with the camera, local mapping can resume if multiple
+RGB-D observations register reliably to the same trusted view. The checkpoint
+records both the supplied and recovered poses for those observations. Set
+`pose_guard.rgbd_recovery` to `false` for the original pause-on-contradiction
+behavior. The guard operates on the laptop. Upstream RF2O/base heading issues
+still affect the rovers' own localization. Accepted visual
 constraints can correct retained keyframe poses and rebuild internal submap
 geometry, but only where valid evidence constrains the trajectory. Short submaps
 and optimization cannot recover missing measurements or guarantee that every

@@ -119,12 +119,21 @@ def ransac_rigid(source, target, threshold=.075, iterations=300, min_inliers=12,
 
 
 def icp(source, target, initial, distance=.15, iterations=12):
-    source, _ = voxel_sample(source, size=.06, limit=1200)
-    target, _ = voxel_sample(target, size=.06, limit=1200)
+    # Exact Euclidean nearest neighbors in a single KD tree. The old 1,200
+    # point displays were too sparse to measure a 6.5 cm registration residual.
+    source, _ = voxel_sample(source, size=.035, limit=12000)
+    target, _ = voxel_sample(target, size=.035, limit=12000)
     current = np.array(initial, dtype=float, copy=True)
+    if min(len(source), len(target)) < 12:
+        return dict(T_target_source=current, overlap_source=0., overlap_target=0., rmse=1e6, inliers=0)
+    source_tree = cv2.flann_Index(source, dict(algorithm=4, leaf_max_size=16))
+    target_tree = cv2.flann_Index(target, dict(algorithm=4, leaf_max_size=16))
+    def query(tree, xyz):
+        ids, d2 = tree.knnSearch(np.ascontiguousarray(xyz, dtype=np.float32), 1, params={'checks': -1})
+        return np.sqrt(np.maximum(d2[:, 0], 0)), ids[:, 0]
     for _ in range(iterations):
         warped = transform(source, current)
-        distances, indices = nearest(warped, target)
+        distances, indices = query(target_tree, warped)
         keep = distances < distance
         if keep.sum() < 12:
             break
@@ -135,30 +144,37 @@ def icp(source, target, initial, distance=.15, iterations=12):
         if pose_delta(np.eye(4), update)[0] < .0002 and pose_delta(np.eye(4), update)[1] < .0002:
             break
     warped = transform(source, current)
-    forward, _ = nearest(warped, target)
-    reverse, _ = nearest(target, warped)
+    forward, _ = query(target_tree, warped)
+    reverse, _ = query(source_tree, transform(target, np.linalg.inv(current)))
     keep = forward < distance
     return dict(T_target_source=current, overlap_source=float(keep.mean()) if len(keep) else 0.,
                 overlap_target=float((reverse < distance).mean()) if len(reverse) else 0.,
-                rmse=float(np.sqrt(np.mean(forward[keep]**2))) if keep.any() else 1e6,
-                inliers=int(keep.sum()))
+                rmse=max(float(np.sqrt(np.mean(d[d < distance]**2))) if (d < distance).any() else 1e6
+                         for d in (forward, reverse)), inliers=int(keep.sum()),
+                icp_source_samples=len(source), icp_target_samples=len(target))
 
 
 def _backproject_pixels(keypoints, depth, intrinsic):
-    points, good = [], []
+    uv = np.asarray(keypoints, dtype=float).reshape(-1, 2)
     height, width = depth.shape
-    for u, v in keypoints:
-        x, y = int(round(u)), int(round(v))
-        if not (1 <= x < width-1 and 1 <= y < height-1):
-            points.append([0, 0, 0]); good.append(False); continue
-        patch = depth[y-1:y+2, x-1:x+2]
-        valid = patch[np.isfinite(patch) & (patch > .15) & (patch < 8)]
-        z = float(np.median(valid)) if len(valid) >= 5 else 0.
-        # Discontinuity neighborhoods create highly biased correspondences.
-        reliable = z > 0 and float(np.ptp(valid)) < .15 if len(valid) else False
-        points.append([(u-intrinsic[0, 2])*z/intrinsic[0, 0], (v-intrinsic[1, 2])*z/intrinsic[1, 1], z])
-        good.append(reliable)
-    return np.asarray(points), np.asarray(good)
+    points, good = np.zeros((len(uv), 3)), np.zeros(len(uv), dtype=bool)
+    rounded = np.rint(uv)
+    inside = (rounded >= 1).all(axis=1) & (rounded < [width-1, height-1]).all(axis=1)
+    if not inside.any():
+        return points, good
+    x, y = rounded[inside].astype(int).T
+    dx, dy = np.tile([-1, 0, 1], 3), np.repeat([-1, 0, 1], 3)
+    patch = depth[y[:, None]+dy, x[:, None]+dx]
+    valid = np.isfinite(patch) & (patch > .15) & (patch < 8)
+    count = valid.sum(axis=1)
+    sorted_z = np.sort(np.where(valid, patch, np.inf), axis=1)
+    rows = np.arange(len(count))
+    z = np.where(count >= 5, .5*(sorted_z[rows, count//2] + sorted_z[rows, np.maximum(0, (count-1)//2)]), 0.)
+    # Exclude depth discontinuities, also during the dense free-space check.
+    good[inside] = (count >= 5) & (np.where(valid, patch, -np.inf).max(axis=1) < sorted_z[:, 0]+.15)
+    points[inside, :2] = (uv[inside]-[intrinsic[0, 2], intrinsic[1, 2]]) * z[:, None] / [intrinsic[0, 0], intrinsic[1, 1]]
+    points[inside, 2] = z
+    return points, good
 
 
 def free_space_conflicts(points_camera, target_depth, target_intrinsic, tolerance=.18):
@@ -180,62 +196,198 @@ def free_space_conflicts(points_camera, target_depth, target_intrinsic, toleranc
     return float((points[valid, 2] < projected[valid, 2]-tolerance).mean()), int(valid.sum())
 
 
-def verify_rgbd(source, target, min_inliers=12, min_overlap=.25, max_rmse=.065):
-    """Mutual distinctive ORB matches -> depth RANSAC -> bounded ICP.
+def _visible_depth_score(cloud, pose, target):
+    """Test the *fixed* pose against what the other depth camera actually saw.
 
-    Pure geometric ICP from an arbitrary initial pose is deliberately not a
-    retrieval verifier: repeated boxes and planes produce convincing false fits.
+    No nearest-neighbor association to a different wall/floor pixel. Unknown,
+    out-of-frustum and occluded samples cannot increase overlap. Contradicted
+    free space is counted over all mutually measured rays, not just inliers.
     """
+    points = transform(cloud, pose)
+    front = points[points[:, 2] > .15]
+    pix = front @ target['K'].T
+    observed, valid = _backproject_pixels(pix[:, :2]/pix[:, 2:], target['depth'], target['K'])
+    dz = front[valid, 2]-observed[valid, 2]
+    agree = np.abs(dz) < .15
+    return dict(overlap=float(agree.sum()/max(1, len(cloud))), measured=len(dz),
+                rmse=float(np.sqrt(np.mean(dz[agree]**2))) if agree.any() else 1e6,
+                inliers=int(agree.sum()), free=float((dz < -.18).mean()) if len(dz) else 0.)
+
+
+def _orb_matches(source, target):
     detector = cv2.ORB_create(nfeatures=1600, fastThreshold=12)
     keys_a, desc_a = detector.detectAndCompute(source['rgb'], None)
     keys_b, desc_b = detector.detectAndCompute(target['rgb'], None)
-    rejected = dict(ok=False, reason="insufficient_visual_features", inliers=0)
-    if desc_a is None or desc_b is None or min(len(desc_a), len(desc_b)) < min_inliers:
-        return rejected
+    meta = dict(matcher='orb_1600_mutual_ratio_0.72', source_features=len(keys_a), target_features=len(keys_b))
+    if desc_a is None or desc_b is None or min(len(desc_a), len(desc_b)) < 2:
+        return np.empty((0, 2)), np.empty((0, 2)), meta
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
     ab, ba = matcher.knnMatch(desc_a, desc_b, k=2), matcher.knnMatch(desc_b, desc_a, k=2)
     reverse = {pair[0].queryIdx: pair[0].trainIdx for pair in ba if len(pair) == 2 and pair[0].distance < .72*pair[1].distance}
     matches = [pair[0] for pair in ab if len(pair) == 2 and pair[0].distance < .72*pair[1].distance
                and reverse.get(pair[0].trainIdx) == pair[0].queryIdx]
-    if len(matches) < min_inliers:
-        return dict(rejected, reason="insufficient_distinctive_mutual_matches", matches=len(matches))
-    pixels_a = np.asarray([keys_a[m.queryIdx].pt for m in matches])
-    pixels_b = np.asarray([keys_b[m.trainIdx].pt for m in matches])
+    return (np.asarray([keys_a[m.queryIdx].pt for m in matches]).reshape(-1, 2),
+            np.asarray([keys_b[m.trainIdx].pt for m in matches]).reshape(-1, 2), meta)
+
+
+def _seed_from_matches(source, target, pixels_a, pixels_b, meta, min_inliers):
+    rejected = dict(meta, ok=False, reason="insufficient_visual_features", inliers=0,
+                    verification_stage='visual_features', visual_matches=len(pixels_a),
+                    depth_correspondences=0, ransac_inliers=0, visual_inliers=0, icp_inliers=0)
+    if min(meta['source_features'], meta['target_features']) < min_inliers:
+        return rejected, None
+    if len(pixels_a) < min_inliers:
+        return dict(rejected, reason="insufficient_distinctive_mutual_matches",
+                    matches=len(pixels_a), verification_stage='distinctive_matching'), None
     points_a, good_a = _backproject_pixels(pixels_a, source['depth'], source['K'])
     points_b, good_b = _backproject_pixels(pixels_b, target['depth'], target['K'])
     valid = good_a & good_b
+    rejected.update(depth_correspondences=int(valid.sum()),
+                    source_matches_with_depth=int(good_a.sum()), target_matches_with_depth=int(good_b.sum()),
+                    verification_stage='depth_correspondences' if valid.sum() < min_inliers else 'geometric_ransac')
     fit = ransac_rigid(points_a[valid], points_b[valid], min_inliers=min_inliers)
+    rejected.update(inliers=fit['inliers'], ransac_inliers=fit['inliers'], visual_inliers=fit['inliers'],
+                    ransac_inlier_ratio=float(fit['inliers']/max(1, valid.sum())))
     if not fit['ok']:
-        return fit
+        return dict(rejected, **fit), None
     inlier_pixels = pixels_a[valid][fit['inlier_mask']]
     h, w = source['rgb'].shape[:2]
     cells = np.floor(inlier_pixels / [w/4, h/3]).astype(int)
-    if len(np.unique(cells, axis=0)) < 4 or fit['inlier_ratio'] < .3:
-        return dict(rejected, reason="localized_or_ambiguous_correspondences", inliers=fit['inliers'])
-    cloud_a = source.get('points_camera')
-    cloud_b = target.get('points_camera')
-    if cloud_a is None:
-        cloud_a, _ = depth_points(source['depth'], source['K'])
-    if cloud_b is None:
-        cloud_b, _ = depth_points(target['depth'], target['K'])
+    rejected.update(image_cells=int(len(np.unique(cells, axis=0))), ransac_rmse=fit['rmse'],
+                    ransac_spread_m=fit['spread'], verification_stage='correspondence_distribution',
+                    T_ransac_target_source=fit['T_target_source'])
+    ht, wt = target['rgb'].shape[:2]
+    other_cells = np.floor(pixels_b[valid][fit['inlier_mask']] / [wt/4, ht/3]).astype(int)
+    rejected['target_image_cells'] = len(np.unique(other_cells, axis=0))
+    if min(rejected['image_cells'], rejected['target_image_cells']) < 4 or fit['inlier_ratio'] < .3:
+        return dict(rejected, reason="localized_or_ambiguous_correspondences"), None
+    fit['_seed_indices'] = np.flatnonzero(valid)[fit['inlier_mask']]
+    return dict(rejected, seed_method='depth_ransac'), fit
+
+
+def _verify_seed(source, target, rejected, fit, min_overlap, max_rmse, pixels=None, min_inliers=12):
+    """A visual proposal is never sufficient: all seeds face the same dense checks."""
+    # Always measure the original calibrated depth, not a keyframe's decimated
+    # visualization points. Bound preprocessing independently of camera size.
+    def cloud(frame):
+        stride = max(2, math.ceil(math.sqrt(frame['depth'].size/36000)))
+        xyz, _ = depth_points(frame['depth'], frame['K'], stride=stride)
+        return xyz
+    cloud_a, cloud_b = cloud(source), cloud(target)
+    seed_indices = fit.pop('_seed_indices', None)
+    checked_pose = None
+    if pixels is not None:
+        from collab_pnp import prepare_reprojection, refine_reprojection
+        seed = fit['T_target_source']
+        data = prepare_reprojection(source, target, *pixels, seed, min_inliers, seed_indices=seed_indices)
+        audit = refine_reprojection(data, seed)
+        rejected.update({k: v for k, v in audit.items() if k.startswith('reprojection_')})
+        rejected.update(verification_stage='pixel_reprojection')
+        if not audit['ok']:
+            return dict(rejected, reason=audit['reason'])
+        checked_pose = audit['T_target_source']
+        fit['T_target_source'] = checked_pose
     refined = icp(cloud_a, cloud_b, fit['T_target_source'])
     shift, rotation = pose_delta(fit['T_target_source'], refined['T_target_source'])
+    rejected.update(icp_inliers=refined['inliers'], icp_rmse=refined['rmse'],
+                    icp_translation_delta_m=shift, icp_rotation_delta_deg=math.degrees(rotation),
+                    overlap_source=refined['overlap_source'], overlap_target=refined['overlap_target'],
+                    T_target_source=refined['T_target_source'], verification_stage='icp_agreement')
     if shift > .15 or rotation > math.radians(8):
         return dict(rejected, reason="icp_disagrees_with_visual_geometry")
-    if min(refined['overlap_source'], refined['overlap_target']) < min_overlap or refined['rmse'] > max_rmse:
-        return dict(rejected, reason="insufficient_depth_overlap", **refined)
+    if checked_pose is not None:
+        # ICP on a featureless plane can slide while improving its NN residual.
+        # Keep its independent veto, but never publish a slid transform. Score
+        # the pose that explained the held-out pixels against original depths.
+        f = _visible_depth_score(cloud_a, checked_pose, target)
+        r = _visible_depth_score(cloud_b, np.linalg.inv(checked_pose), source)
+        overlap = f['overlap'], r['overlap']
+        residual = max(f['rmse'], r['rmse'])
+        free = max(f['free'], r['free'])
+        rejected.update(T_icp_target_source=refined['T_target_source'], T_target_source=checked_pose,
+                        residual_method='bidirectional_visible_depth', depth_rmse=residual,
+                        overlap_source=overlap[0], overlap_target=overlap[1], free_space_conflict=free,
+                        free_space_samples=[f['measured'], r['measured']])
+        if min(f['measured'], r['measured']) < 40 or min(overlap) < min_overlap:
+            return dict(rejected, reason='insufficient_depth_overlap', verification_stage='depth_overlap')
+        if residual > max_rmse:
+            return dict(rejected, reason='depth_alignment_residual_too_large', verification_stage='depth_residual')
+        if free > .18:
+            return dict(rejected, reason='mutually_observed_free_space_conflict', verification_stage='free_space_consistency')
+        fit.pop('inlier_mask', None)
+        return dict(fit | rejected, ok=True, reason='rgbd_verified', verification_stage='verified',
+                    rmse=residual, translation_sigma=max(.03, 2*residual),
+                    rotation_sigma=max(math.radians(2), max(.03, 2*residual)/max(.3, fit['spread'])))
+    rejected['verification_stage'] = 'depth_overlap'
+    if min(refined['overlap_source'], refined['overlap_target']) < min_overlap:
+        return dict(rejected, reason="insufficient_depth_overlap")
+    rejected['verification_stage'] = 'depth_residual'
+    if refined['rmse'] > max_rmse:
+        return dict(rejected, reason="depth_alignment_residual_too_large")
     forward_conflict, forward_count = free_space_conflicts(transform(cloud_a, refined['T_target_source']), target['depth'], target['K'])
     reverse_conflict, reverse_count = free_space_conflicts(transform(cloud_b, np.linalg.inv(refined['T_target_source'])), source['depth'], source['K'])
     refined['free_space_conflict'] = max(forward_conflict if forward_count >= 40 else 0., reverse_conflict if reverse_count >= 40 else 0.)
+    rejected.update(free_space_conflict=refined['free_space_conflict'], free_space_samples=[forward_count, reverse_count],
+                    verification_stage='free_space_consistency')
+    if min(forward_count, reverse_count) < 40:
+        return dict(rejected, reason="insufficient_mutually_observed_depth")
     if refined['free_space_conflict'] > .18:
-        return dict(rejected, reason="mutually_observed_free_space_conflict", **refined)
+        return dict(rejected, reason="mutually_observed_free_space_conflict")
     fit.pop('inlier_mask', None)
     fit.update(refined)
-    fit.update(ok=True, reason="rgbd_verified", visual_inliers=int(len(inlier_pixels)), image_cells=int(len(np.unique(cells, axis=0))))
+    fit.update(rejected)
+    fit.update(ok=True, reason="rgbd_verified", verification_stage='verified')
     # Registration uncertainty is conservative; it is NOT input odometry covariance.
     fit['translation_sigma'] = max(.03, 2*fit['rmse'])
     fit['rotation_sigma'] = max(math.radians(2), fit['translation_sigma']/max(.3, fit['spread']))
     return fit
+
+
+def _stage_rank(result):
+    stages = ('visual_features', 'distinctive_matching', 'depth_correspondences', 'geometric_ransac',
+              'correspondence_distribution', 'pixel_reprojection', 'icp_agreement', 'depth_overlap', 'depth_residual',
+              'free_space_consistency', 'verified')
+    stage = result.get('verification_stage')
+    return (stages.index(stage) if stage in stages else -1, result.get('visual_inliers', 0),
+            result.get('depth_correspondences', 0), result.get('visual_matches', 0))
+
+
+def verify_rgbd(source, target, min_inliers=12, min_overlap=.25, max_rmse=.065, *, matcher_mode='auto'):
+    """Try inexpensive ORB first. Expand visual proposals, not acceptance tolerances.
+
+    If an established seed contradicts dense geometry, reject that pair; do
+    not keep searching for a transform that happens to pass. No latest-pose,
+    semantic-similarity, or uninitialized ICP fallback.
+    """
+    if matcher_mode not in ('auto', 'orb'):
+        raise ValueError("matcher_mode must be 'auto' or 'orb'")
+    from collab_visual_matches import visual_matches
+    attempts = []
+    for proposals in ([_orb_matches] if matcher_mode == 'orb' else [_orb_matches, visual_matches]):
+        a, b, meta = proposals(source, target)
+        evidence, seed = _seed_from_matches(source, target, a, b, meta, min_inliers)
+        if seed is None and proposals is visual_matches and min(
+                evidence.get('source_matches_with_depth', 0), evidence.get('target_matches_with_depth', 0)) >= min_inliers:
+            from collab_pnp import bidirectional_pnp_seed
+            pnp = bidirectional_pnp_seed(source, target, a, b, min_inliers=min_inliers)
+            evidence['pnp_reason'] = pnp['reason']
+            evidence.update({k: v for k, v in pnp.items() if k.startswith('pnp_')})
+            if pnp['ok']:
+                seed = dict(pnp)
+                evidence.update(seed_method='bidirectional_pnp', inliers=pnp['inliers'],
+                                visual_inliers=pnp['visual_inliers'], image_cells=pnp['image_cells'])
+        if seed is not None:
+            result = _verify_seed(source, target, evidence, seed, min_overlap, max_rmse,
+                                  (a, b) if proposals is visual_matches else None, min_inliers)
+            attempts.append(result)
+            break
+        attempts.append(evidence)
+    result = max(attempts, key=_stage_rank)
+    # Store small diagnostics per attempt, not descriptors, masks or a runner-up transform.
+    fields = ('matcher', 'reason', 'verification_stage', 'visual_matches', 'depth_correspondences',
+              'ransac_inliers', 'pnp_reason', 'visual_inliers', 'seed_method')
+    result['attempts'] = [{k: r[k] for k in fields if k in r} for r in attempts]
+    return result
 
 
 def geometry_descriptor(points):

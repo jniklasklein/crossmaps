@@ -36,6 +36,18 @@ def observation(robot='A', seq=1, session='s1', local_pose=None, texture=8, enti
 
 
 class CollaborativeGeometryTests(unittest.TestCase):
+    def test_visible_depth_measures_the_supplied_pose_in_both_camera_directions(self):
+        from collab_geometry import _visible_depth_score
+        a = observation()
+        cloud, _ = depth_points(a['depth'], a['K'])
+        aligned = _visible_depth_score(cloud, np.eye(4), a)
+        self.assertGreater(aligned['overlap'], .9)
+        self.assertLess(aligned['rmse'], .01)
+        shifted = np.eye(4); shifted[2, 3] = -.8
+        conflict = _visible_depth_score(cloud, shifted, a)
+        self.assertLess(conflict['overlap'], .1)
+        self.assertGreater(conflict['free'], .9)
+
     def test_rigid_ransac_rejects_outliers_and_preserves_direction(self):
         rng = np.random.default_rng(42)
         source = rng.normal(size=(80, 3))
@@ -60,6 +72,41 @@ class CollaborativeGeometryTests(unittest.TestCase):
         self.assertGreater(result['image_cells'], 3)
         second['rgb'][:] = 100
         self.assertFalse(verify_rgbd(first, second)['ok'])
+
+    def test_registration_stage_counts_distinguish_visual_evidence_from_dense_icp(self):
+        first, second = observation('A'), observation('B')
+        result = verify_rgbd(first, second)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['verification_stage'], 'verified')
+        self.assertGreaterEqual(result['visual_matches'], result['depth_correspondences'])
+        self.assertGreaterEqual(result['depth_correspondences'], result['ransac_inliers'])
+        self.assertEqual(result['inliers'], result['ransac_inliers'])
+        self.assertEqual(result['visual_inliers'], result['ransac_inliers'])
+        self.assertGreater(result['icp_inliers'], 0)
+        self.assertIn('icp_rmse', result)
+        self.assertIn('ransac_rmse', result)
+
+    def test_depth_residual_failure_is_not_mislabeled_as_low_overlap(self):
+        refinement = dict(T_target_source=np.eye(4), overlap_source=.8, overlap_target=.9, rmse=.08, inliers=900)
+        with patch('collab_geometry.icp', return_value=refinement):
+            result = verify_rgbd(observation('A'), observation('B'))
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['reason'], 'depth_alignment_residual_too_large')
+        self.assertEqual(result['verification_stage'], 'depth_residual')
+        self.assertEqual(result['icp_inliers'], 900)
+        self.assertEqual(result['icp_rmse'], .08)
+        self.assertGreaterEqual(result['ransac_inliers'], 12)
+        self.assertEqual(result['inliers'], result['ransac_inliers'])
+
+    def test_missing_depth_reports_which_correspondences_were_removed(self):
+        first, second = observation('A'), observation('B')
+        second['depth'][:] = 0
+        result = verify_rgbd(first, second)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['verification_stage'], 'depth_correspondences')
+        self.assertGreaterEqual(result['visual_matches'], 12)
+        self.assertEqual(result['target_matches_with_depth'], 0)
+        self.assertEqual(result['depth_correspondences'], 0)
 
     def test_unrelated_images_not_accepted_by_similar_geometry(self):
         result = verify_rgbd(observation(texture=3), observation(texture=99))
@@ -223,6 +270,24 @@ class CollaborativeBackendTests(unittest.TestCase):
         backend.command(dict(action='reject_constraint', id=verified[0]['constraint_id']))
         self.assertFalse(backend.snapshot()['robots'][1]['aligned'])
 
+    def test_alignment_summary_includes_retained_but_unchecked_candidates(self):
+        backend = Backend(dict(verifications_per_keyframe=1, candidate_top_k=3))
+        backend.ingest(observation('A', seq=1))
+        backend.ingest(observation('A', seq=2))
+        backend.ingest(observation('B'))
+        summary = backend.snapshot()['alignment_evidence']
+        self.assertEqual(summary, dict(retrieved=2, checked=1, verified=1, active=0, best_rejection=None))
+
+    def test_recent_target_gets_a_bounded_proposal_not_a_free_verification(self):
+        backend = Backend(dict(candidate_top_k=1, verifications_per_keyframe=2))
+        with patch.object(backend, '_scores', side_effect=lambda source, target: {'clip': 1/target['seq']}), \
+                patch('collab_backend.verify_rgbd', return_value=dict(ok=False, reason='test_rejected', inliers=0)) as check:
+            for seq in (1, 2, 3):
+                backend.ingest(dict(observation('A', seq=seq), received_monotonic=float(10*seq)))
+            backend.ingest(dict(observation('B'), received_monotonic=31.))
+        self.assertEqual([call.args[1]['seq'] for call in check.call_args_list], [1, 3])
+        self.assertTrue(all(not edge['active'] for edge in backend.constraints.values() if edge['kind'] == 'loop'))
+
     def test_partial_masks_can_propose_same_entity_without_segment_merging(self):
         backend = self.backend()
         first, second = observation('A'), observation('B')
@@ -241,6 +306,26 @@ class CollaborativeBackendTests(unittest.TestCase):
         backend.ingest(observation('A')); backend.ingest(observation('B'))
         backend.ingest(observation('B', seq=2))
         self.assertTrue(all(edge['state']=='verified' for edge in backend.constraints.values() if edge['kind']=='loop'))
+
+    def test_moving_only_target_rover_corroborates_in_either_match_order(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                backend = self.backend()
+                backend.ingest(observation('A'))
+                backend.ingest(observation('B'))
+                backend.ingest(observation('B', 2, local_pose=pose(.25), texture=3))
+                a, b, moved_b = backend.keyframes
+                def edge(name, source, target):
+                    return dict(id=name, kind='loop', state='verified', corroborations=1,
+                                source_frame=source, target_frame=target,
+                                source_session=backend.keyframes[source]['source_id'],
+                                target_session=backend.keyframes[target]['source_id'],
+                                T_targetlocal_sourcelocal=np.eye(4))
+                prior = edge('prior', b, a) if reverse else edge('prior', a, b)
+                current = edge('current', a, moved_b)
+                backend.constraints.update(prior=prior, current=current)
+                backend._corroborate(current)
+                self.assertEqual(current['state'], 'corroborated')
 
     def test_capacity_is_explicit_preserves_existing_evidence(self):
         backend = self.backend(max_keyframes=1)

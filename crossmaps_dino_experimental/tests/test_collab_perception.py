@@ -1,5 +1,6 @@
 """Fleet tests run real v2 fusion/identity without ROS, weights or a robot."""
 import copy
+import json
 import math
 import threading
 import unittest
@@ -59,15 +60,29 @@ class Factory:
             return [np.ones(rgb.shape[:2], bool)], np.ones(1, np.float32)
         node.segment_esam_masks = masks
         def dense(rgb):
-            features = np.zeros((2, 2, 2), np.float32)
+            features = np.zeros((2, 2, 4), np.float32)
             features[..., 0] = 1.
             return dict(features=features, meta=dict(input_size=2, resized_w=2, resized_h=2,
                                                      offset_x=0, offset_y=0))
         node.compute_dinov2_dense_features = dense
         node.compute_dinov2_mask_embeddings = lambda masks, dense, return_quality: (
-            np.tile([1., 0.], (len(masks), 1)).astype(np.float32), np.ones(len(masks), np.float32))
+            np.tile([1., 0., 0., 0.], (len(masks), 1)).astype(np.float32), np.ones(len(masks), np.float32))
         node.compute_mask_embeddings_batched = lambda rgb, masks, dense_clip: np.tile(
-            [1., 0.], (len(masks), 1)).astype(np.float32)
+            [1., 0., 0., 0.], (len(masks), 1)).astype(np.float32)
+        # Execute the production camera-space renderers, stubbing only ROS IO.
+        del node.publish_esam_mask_overlay
+        del node.publish_feature_diagnostics
+        node.feature_color_projections = {}
+        node.debug_rgb_image_has_subscribers = lambda *args: True
+        for attribute, view in {"esam_mask_overlay": "sam", "dinov2_feature_view": "dino",
+                "dinov2_similarity_view": "dino_similarity", "dinov2_instance_view": "dino_instances",
+                "clip_feature_view": "clip", "clip_similarity_view": "clip_similarity"}.items():
+            setattr(node, "pub_" + attribute, view)
+            setattr(node, "pub_" + attribute + "_compressed", None)
+        def capture(view, compressed_pub, rgb, header, **kwargs):
+            stamp = header.stamp.sec * 1_000_000_000 + header.stamp.nanosec
+            sink(robot, view, cv2.cvtColor(np.asarray(rgb, np.uint8), cv2.COLOR_RGB2BGR), stamp)
+        node.publish_debug_rgb_image = capture
         self.created.append(node)
         return node
 
@@ -168,7 +183,162 @@ class FleetTests(unittest.TestCase):
         self.assertFalse(result["integration_allowed"])
         self.assertEqual(before, node.seg_obs_count)
         self.assertEqual(result["surfaces"], [])
-        self.assertEqual(self.fleet.get_image("A", "rgb")[1], 1_000_000_000)
+        self.assertEqual(self.fleet.get_image("A", "rgb")[1], 2_000_000_000)
+        self.assertEqual(self.fleet.get_image("A", "depth")[1], 2_000_000_000)
+        self.assertEqual(self.fleet.health()["A"]["session_id"], "test_session")
+        self.assertFalse(result["map_integrated"])
+        self.assertTrue(result["visual_processed"])
+
+    def test_validated_pose_is_shared_by_local_fusion_and_backend_with_raw_provenance(self):
+        original = frame()
+        self.fleet.process(original)
+        node = self.fleet.nodes[0]
+        incoming = frame(seq=2)
+        incoming["T_local_camera"][0, 3] = 1.
+        corrected = np.eye(4)
+        quality = dict(integration_allowed=True, status="visual_rgbd_recovered",
+                       mapping_pose_corrected=True, corrected_T_local_camera=corrected.tolist(),
+                       external_T_local_camera=incoming["T_local_camera"].tolist())
+        with patch.object(self.fleet._guards["A"], "check", return_value=quality), \
+                patch.object(node, "apply_semantic_result", wraps=node.apply_semantic_result) as apply:
+            result = self.fleet.process(incoming)
+        np.testing.assert_allclose(result["T_local_camera"], corrected)
+        np.testing.assert_allclose(apply.call_args.args[0]["pts_int"], result["points_camera"])
+        self.assertEqual(incoming["T_local_camera"][0, 3], 1.)  # Input/raw source is immutable.
+        self.assertEqual(result["pose_quality"]["external_T_local_camera"][0][3], 1.)
+        json.dumps(result["pose_quality"], allow_nan=False)
+
+    def test_pose_recovery_config_reaches_guard_and_health(self):
+        settings = config()
+        settings["pose_guard"] = dict(rgbd_recovery=False)
+        fleet = PerceptionFleet(settings, node_factory=self.factory)
+        try:
+            fleet.process(frame())
+            self.assertFalse(fleet._guards["A"].rgbd_recovery)
+            self.assertFalse(fleet.health()["A"]["pose_quality"]["rgbd_recovery_enabled"])
+        finally:
+            fleet.close()
+
+    def test_rejected_pose_keeps_all_2d_diagnostics_live_without_recoloring_map_ids(self):
+        initial = frame()
+        initial["received_monotonic"] = 100.
+        self.fleet.process(initial)
+        node = self.fleet.nodes[0]
+        identity = copy.deepcopy(node.entity_memory.to_dict())
+        counts = copy.deepcopy(node.seg_obs_count)
+        for view in ("segments", "entities"):
+            self.fleet._put_image("A", view, initial["rgb"], initial["stamp_ns"])
+        old_ids = {view: self.fleet.get_image("A", view) for view in ("segments", "entities")}
+        incoming = frame(seq=2)
+        incoming["received_monotonic"] = 101.
+        with patch.object(self.fleet._guards["A"], "check", return_value={
+                "integration_allowed": False, "status": "visual_odometry_contradiction"}):
+            result = self.fleet.process(incoming)
+        for view in ("rgb", "depth", "sam", "dino", "dino_similarity", "dino_instances", "clip", "clip_similarity"):
+            self.assertEqual(self.fleet.get_image("A", view, session_id="test_session")[1], 2_000_000_000, view)
+            self.assertEqual(self.fleet.image_metadata("A", "test_session")[view], 101., view)
+        for view in old_ids:
+            self.assertEqual(self.fleet.get_image("A", view), old_ids[view])
+            self.assertEqual(self.fleet.image_metadata("A", "test_session")[view], 100.)
+        self.assertEqual(identity, node.entity_memory.to_dict())
+        self.assertEqual(counts, node.seg_obs_count)
+        self.assertEqual(node.last_applied_observation_seq, 1)
+        self.assertEqual(len(node.model_inputs), 2)
+        self.assertEqual(result["last_integrated_stamp_ns"], 1_000_000_000)
+        self.assertEqual(result["last_visual_stamp_ns"], 2_000_000_000)
+        self.assertFalse(result.get("preview_only", False))
+        self.assertEqual(result["timings_ms"]["fusion_ms"], 0.)
+
+    def test_missing_tf_preview_runs_models_without_seeding_pose_or_world_state(self):
+        incoming = frame()
+        incoming.update(preview_only=True, T_local_camera=None, received_monotonic=90.)
+        result = self.fleet.process(incoming)
+        node = self.fleet.nodes[0]
+        self.assertTrue(result["preview_only"])
+        self.assertFalse(result["integration_allowed"])
+        self.assertFalse(result["map_integrated"])
+        self.assertFalse(result["pose_quality"]["guard_evaluated"])
+        self.assertIsNone(self.fleet._guards["A"].anchor)
+        self.assertIsNone(self.fleet._guards["A"].previous_pose)
+        self.assertEqual(node.seg_w, {})
+        self.assertEqual(node.entity_memory.records, {})
+        self.assertEqual(node.last_applied_observation_seq, -1)
+        self.assertEqual(result["surfaces"], [])
+        self.assertIsNone(self.fleet.get_image("A", "segments"))
+        self.assertIsNone(self.fleet.get_image("A", "entities"))
+        for view in ("sam", "dino", "dino_similarity", "dino_instances", "clip", "clip_similarity", "depth"):
+            self.assertEqual(self.fleet.get_image("A", view)[1], incoming["stamp_ns"])
+        self.assertEqual(self.fleet.health()["A"]["session_id"], "test_session")
+
+    def test_same_stamp_preview_promotes_once_and_reuses_inference(self):
+        incoming = frame()
+        incoming.update(preview_only=True, T_local_camera=None, received_monotonic=90.)
+        self.fleet.process(incoming)
+        promoted = frame(seq=2)
+        promoted.update(stamp_ns=incoming["stamp_ns"], rgb_stamp_ns=incoming["rgb_stamp_ns"], received_monotonic=95.)
+        result = self.fleet.process(promoted)
+        node = self.fleet.nodes[0]
+        self.assertTrue(result["inference_reused"])
+        self.assertTrue(result["map_integrated"])
+        self.assertEqual(node.seg_obs_count[101], 1)
+        self.assertEqual(node.last_applied_observation_seq, 2)
+        self.assertEqual(len(node.model_inputs), 1)
+        # Arrival of TF must not make the same old camera image look newer.
+        self.assertEqual(self.fleet.image_metadata("A", "test_session")["sam"], 90.)
+        for preview in (False, True):
+            repeated = dict(promoted, seq=3, preview_only=preview)
+            with self.assertRaisesRegex(ValueError, "Duplicate"):
+                self.fleet.process(repeated)
+        self.assertEqual(node.seg_obs_count[101], 1)
+
+    def test_promotion_does_not_reuse_different_image_or_calibration(self):
+        incoming = frame()
+        incoming.update(preview_only=True, T_local_camera=None)
+        self.fleet.process(incoming)
+        promoted = frame(seq=2)
+        promoted.update(stamp_ns=incoming["stamp_ns"], rgb_stamp_ns=incoming["rgb_stamp_ns"])
+        promoted["rgb"][:] = [200, 50, 40]
+        result = self.fleet.process(promoted)
+        self.assertFalse(result["inference_reused"])
+        self.assertEqual(len(self.fleet.nodes[0].model_inputs), 2)
+
+    def test_preview_does_not_advance_existing_guard_and_valid_frame_recovers(self):
+        self.fleet.process(frame())
+        guard = self.fleet._guards["A"]
+        old_pose = (guard.previous_pose[0], guard.previous_pose[1].copy())
+        incoming = frame(seq=2)
+        incoming.update(preview_only=True)
+        incoming.pop("T_local_camera")
+        with patch.object(guard, "check", side_effect=AssertionError("Preview must not evaluate the pose guard")):
+            self.fleet.process(incoming)
+        self.assertEqual(guard.previous_pose[0], old_pose[0])
+        np.testing.assert_array_equal(guard.previous_pose[1], old_pose[1])
+        result = self.fleet.process(frame(seq=3))
+        self.assertTrue(result["map_integrated"])
+        self.assertEqual(self.fleet.nodes[0].seg_obs_count[101], 2)
+
+    def test_image_session_provenance_does_not_depend_on_current_health(self):
+        self.fleet.process(frame())
+        self.fleet._health["A"] = {"status": "error"}
+        self.assertIsNotNone(self.fleet.get_image("A", "sam", session_id="test_session"))
+        self.assertIsNone(self.fleet.get_image("A", "sam", session_id="different_session"))
+        self.assertTrue(self.fleet.image_metadata("A", "test_session"))
+        self.assertEqual(self.fleet.image_metadata("A", "different_session"), {})
+        incoming = frame(session="restarted")
+        incoming.update(preview_only=True, T_local_camera=None)
+        self.fleet.process(incoming)
+        self.assertIsNone(self.fleet.get_image("A", "sam", session_id="test_session"))
+        self.assertIsNotNone(self.fleet.get_image("A", "sam", session_id="restarted"))
+        self.assertIsNone(self.fleet.get_image("A", "entities", session_id="restarted"))
+
+    def test_missing_pose_requires_explicit_preview_mode(self):
+        incoming = frame()
+        incoming.pop("T_local_camera")
+        with self.assertRaisesRegex(ValueError, "Invalid T_local_camera"):
+            self.fleet.process(incoming)
+        incoming["preview_only"] = "true"
+        with self.assertRaisesRegex(ValueError, "explicit boolean"):
+            self.fleet.process(incoming)
 
     def test_bad_registration_and_reflected_transform_rejected_before_loading(self):
         bad = frame()
@@ -218,6 +388,20 @@ class DescriptorAndPoseTests(unittest.TestCase):
         depth = np.full(texture.shape, 3., np.float32)
         K = np.array([[300., 0, 320.], [0, 300., 240.], [0, 0, 1.]])
         return rgb, depth, K
+
+    @classmethod
+    def nonplanar_scene(cls):
+        rgb, depth, K = cls.textured_scene()
+        depth[:, :160], depth[:, 160:320] = 2., 3.
+        depth[:, 320:480], depth[:, 480:] = 4., 2.5
+        return rgb, depth, K
+
+    @staticmethod
+    def yaw(angle_deg):
+        angle = math.radians(angle_deg)
+        T = np.eye(4)
+        T[:2, :2] = [[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]]
+        return T
 
     def test_global_descriptor_excludes_letterbox_padding(self):
         features = np.array([[[0., 1.], [0., 1.]], [[1., 0.], [1., 0.]]], np.float32)
@@ -289,6 +473,141 @@ class DescriptorAndPoseTests(unittest.TestCase):
         result = guard.check(rgb, depth, K, T, 2_000_000_000)
         self.assertEqual(result["status"], "external_pose_discontinuity")
         self.assertFalse(result["integration_allowed"])
+
+    def test_distributed_nonplanar_rgbd_recovers_only_after_three_fresh_observations(self):
+        rgb, depth, K = self.nonplanar_scene()
+        guard = PoseConsistencyGuard()
+        anchor = self.yaw(7.)
+        anchor[:3, 3] = [.7, .2, 1.]
+        guard.check(rgb, depth, K, anchor, 1_000_000_000)
+        raw = anchor @ self.yaw(18.)
+        first = guard.check(rgb, depth, K, raw, 2_000_000_000)
+        self.assertFalse(first["integration_allowed"])
+        self.assertEqual(first["status"], "rgbd_recovery_pending")
+        self.assertEqual(first["recovery_confirmations"], 1)
+        duplicate = guard.check(rgb, depth, K, raw, 2_000_000_000)
+        self.assertFalse(duplicate["integration_allowed"])
+        self.assertEqual(duplicate["recovery_confirmations"], 1)
+        self.assertFalse(guard.check(rgb, depth, K, raw, 3_000_000_000)["integration_allowed"])
+        recovered = guard.check(rgb, depth, K, raw, 4_000_000_000)
+        self.assertTrue(recovered["integration_allowed"])
+        self.assertEqual(recovered["status"], "visual_rgbd_recovered")
+        np.testing.assert_allclose(recovered["corrected_T_local_camera"], anchor, atol=1e-5)
+        np.testing.assert_allclose(recovered["external_T_local_camera"], raw)
+        np.testing.assert_allclose(guard.previous_pose[1], anchor, atol=1e-5)
+        self.assertEqual(recovered["anchor_stamp_ns"], 1_000_000_000)
+        self.assertGreaterEqual(recovered["rgbd_support_cells"], 6)
+        self.assertGreater(recovered["rgbd_dense_agreement"], .99)
+        self.assertFalse(recovered["is_localization_fix"])
+        json.dumps(recovered, allow_nan=False)
+
+    def test_recovery_never_falls_back_to_unvalidated_raw_or_reanchors_when_lost(self):
+        rgb, depth, K = self.nonplanar_scene()
+        guard = PoseConsistencyGuard()
+        guard.check(rgb, depth, K, np.eye(4), 1_000_000_000)
+        for seq in (2, 3, 4):
+            result = guard.check(rgb, depth, K, self.yaw(30.), seq * 1_000_000_000)
+        self.assertTrue(result["integration_allowed"])
+        anchor = guard.anchor
+        weak = guard.check(np.zeros_like(rgb), depth, K, np.eye(4), 5_000_000_000)
+        self.assertFalse(weak["integration_allowed"])
+        self.assertIs(guard.anchor, anchor)
+        # Even a raw pose inside the normal 5-degree gate must not silently
+        # jump away from the already corrected camera/local coordinates.
+        for seq in (6, 7, 8):
+            near = guard.check(rgb, depth, K, self.yaw(4.), seq * 1_000_000_000)
+        self.assertTrue(near["mapping_pose_corrected"])
+        self.assertIs(guard.anchor, anchor)
+        resumed = guard.check(rgb, depth, K, np.eye(4), 9_000_000_000)
+        self.assertTrue(resumed["integration_allowed"])
+        self.assertTrue(resumed["resumed_external_pose"])
+        self.assertFalse(resumed["rgbd_recovery_active"])
+        self.assertNotIn("external_T_local_camera", resumed)
+        self.assertNotIn("corrected_T_local_camera", resumed)
+
+    def test_planar_or_disabled_recovery_does_not_override_pose_rejection(self):
+        for use_nonplanar, enabled in ((False, True), (True, False)):
+            rgb, depth, K = self.nonplanar_scene() if use_nonplanar else self.textured_scene()
+            guard = PoseConsistencyGuard(rgbd_recovery=enabled)
+            guard.check(rgb, depth, K, np.eye(4), 1_000_000_000)
+            for seq in range(2, 6):
+                result = guard.check(rgb, depth, K, self.yaw(20.), seq * 1_000_000_000)
+                self.assertFalse(result["integration_allowed"])
+            if enabled:
+                self.assertEqual(result["recovery_reason"], "support_not_distributed_at_multiple_depths")
+
+    def test_recovery_tracks_validated_camera_motion_instead_of_freezing_pose(self):
+        rgb, depth, K = self.nonplanar_scene()
+        guard = PoseConsistencyGuard()
+        guard.check(rgb, depth, K, np.eye(4), 1_000_000_000)
+        for seq in (2, 3, 4):
+            guard.check(rgb, depth, K, self.yaw(20.), seq * 1_000_000_000)
+        camera = self.yaw(3.)
+        H = K @ camera[:3, :3].T @ np.linalg.inv(K)
+        moved_rgb = cv2.warpPerspective(rgb, H, (640, 480))
+        moved_depth = cv2.warpPerspective(depth, H, (640, 480), flags=cv2.INTER_NEAREST)
+        result = guard.check(moved_rgb, moved_depth, K, self.yaw(20.), 5_000_000_000)
+        self.assertTrue(result["integration_allowed"])
+        np.testing.assert_allclose(result["corrected_T_local_camera"], camera, atol=.02)
+        self.assertIsNotNone(guard.anchor)
+        np.testing.assert_array_equal(guard.anchor["T"], np.eye(4))
+
+    def test_raw_resume_outside_recovery_window_still_requires_strong_support_and_continuity(self):
+        guard = PoseConsistencyGuard()
+        guard.visual_tracking_active = True
+        guard.recovery_hits = 3
+        guard.recovery_candidate = (1_000_000_000, np.eye(4))
+        camera = self.yaw(18.)
+        reference = dict(T=np.eye(4), stamp_ns=1_000_000_000)
+        # Registration proof is independently tested above; isolate the source
+        # transition here. Raw TF now agrees exactly, with a plausible rate.
+        with patch.object(guard, "_recovery_evidence", return_value={"recovery_validated": True}):
+            result = guard._recover(reference, {}, [], [], np.linalg.inv(camera), None, None, camera,
+                                    2_000_000_000, dict(integration_allowed=True))
+        self.assertTrue(result["integration_allowed"])
+        self.assertTrue(result["resumed_external_pose"])
+        self.assertFalse(guard.visual_tracking_active)
+        self.assertNotIn("corrected_T_local_camera", result)
+
+    def test_recovered_pose_cannot_be_chained_beyond_trusted_anchor_window(self):
+        rgb, depth, K = self.nonplanar_scene()
+        guard = PoseConsistencyGuard()
+        guard.check(rgb, depth, K, np.eye(4), 1_000_000_000)
+        for seq in (2, 3, 4):
+            guard.check(rgb, depth, K, self.yaw(20.), seq * 1_000_000_000)
+        # Project actual camera rotation about the optical axis; depth follows
+        # the same homography. Recovery must stop, not create a new VO anchor.
+        camera = self.yaw(18.)
+        H = K @ camera[:3, :3].T @ np.linalg.inv(K)
+        moved_rgb = cv2.warpPerspective(rgb, H, (640, 480))
+        moved_depth = cv2.warpPerspective(depth, H, (640, 480), flags=cv2.INTER_NEAREST)
+        result = guard.check(moved_rgb, moved_depth, K, self.yaw(40.), 5_000_000_000)
+        self.assertFalse(result["integration_allowed"])
+        np.testing.assert_array_equal(guard.anchor["T"], np.eye(4))
+        self.assertTrue(guard.visual_tracking_active)
+
+    def test_moving_foreground_fit_cannot_override_conflicting_dense_background(self):
+        rgb, depth, K = self.nonplanar_scene()
+        guard = PoseConsistencyGuard()
+        reference = guard._features(rgb, depth, K, np.eye(4))
+        current = guard._features(rgb, depth, K, np.eye(4))
+        # Give PnP an apparently perfect, broadly distributed moving foreground
+        # fit, but leave independent background RGB-D unchanged. Feature count
+        # and depth fit alone must not authorize a camera movement.
+        u, v = np.meshgrid(np.linspace(60., 575., 15), np.linspace(50., 425., 10))
+        z = np.where(u < 320., 2., 4.)
+        xyz = np.column_stack(((u.ravel()-320.)*z.ravel()/300.,
+                               (v.ravel()-240.)*z.ravel()/300., z.ravel()))
+        visual = np.eye(4)
+        visual[2, 3] = .3
+        moved = xyz + visual[:3, 3]
+        reference["points"] = xyz
+        current["points"] = moved
+        current["pixels"] = moved[:, :2]/moved[:, 2, None]*[300., 300.]+[320., 240.]
+        matches = [SimpleNamespace(queryIdx=i, trainIdx=i) for i in range(len(xyz))]
+        evidence = guard._recovery_evidence(reference, current, matches, np.arange(len(xyz)), visual, depth, K)
+        self.assertFalse(evidence["recovery_validated"])
+        self.assertEqual(evidence["recovery_reason"], "background_or_dense_geometry_conflict")
 
 
 if __name__ == "__main__":

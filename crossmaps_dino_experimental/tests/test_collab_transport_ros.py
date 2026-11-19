@@ -104,7 +104,7 @@ class AdapterRosSmokeTests(unittest.TestCase):
                 try:
                     health = source.health.get_nowait()
                     # Avoid printing JPEG bytes on assertion failures.
-                    result[source.robot["id"]] = {k: v for k, v in health.items() if k != "preview_jpeg"}
+                    result[source.robot["id"]] = {k: v for k, v in health.items() if k not in ("preview_jpeg", "depth_preview_jpeg")}
                 except queue.Empty:
                     break
         return result
@@ -146,7 +146,7 @@ class AdapterRosSmokeTests(unittest.TestCase):
          msg.transform.translation.z) = map(float, translation)
         return msg
 
-    def _pair(self, source, color, depth_m, pose, delayed_tf=False):
+    def _pair(self, source, color, depth_m, pose, delayed_tf=False, omit_tf=False):
         from sensor_msgs.msg import CompressedImage
         now_ns = source.node.get_clock().now().nanoseconds
         image_stamp = self._stamp(now_ns - 100_000_000)
@@ -167,7 +167,7 @@ class AdapterRosSmokeTests(unittest.TestCase):
         at_capture = self._tf(image_stamp, "odom", "base_link", pose)
         # A latest-TF fallback would give a wildly incorrect pose and fail.
         later = self._tf(latest_stamp, "odom", "base_link", np.asarray(pose) + [20., 0., 0.])
-        if not delayed_tf:
+        if not delayed_tf and not omit_tf:
             source.tf.sendTransform([at_capture, later])
             self._spin_for(.05)
         source.rgb.publish(rgb)
@@ -228,6 +228,79 @@ class AdapterRosSmokeTests(unittest.TestCase):
         packet = self._packet(source)
         self.assertEqual(packet["stamp_ns"], stamp)
         np.testing.assert_allclose(packet["T_local_camera"][:3, 3], [3.1, 1., .6], atol=1e-6)
+
+    def test_sustained_tf_gap_offers_model_preview_then_same_stamp_mapping_completion(self):
+        source = self.channels[0]
+        stamp = self._pair(source, (45, 100, 200), 1.8, (3., 1., .4), omit_tf=True)
+        preview = self._packet(source)
+        self.assertTrue(preview['preview_only'])
+        self.assertFalse(preview['integration_allowed'])
+        self.assertIsNone(preview['T_local_camera'])
+        self.assertEqual(preview['stamp_ns'], stamp)
+        self.assertEqual(preview['depth_registration'], 'same_optical_frame')
+        self.assertGreaterEqual(preview['transport_timing']['pending_wait_s'], .35)
+        capture = self._tf(self._stamp(stamp), 'odom', 'base_link', (3., 1., .4))
+        later = self._tf(source.node.get_clock().now().to_msg(), 'odom', 'base_link', (30., 1., .4))
+        source.tf.sendTransform([capture, later])
+        mapped = self._packet(source)
+        self.assertFalse(mapped['preview_only'])
+        self.assertTrue(mapped['integration_allowed'])
+        self.assertEqual(mapped['stamp_ns'], preview['stamp_ns'])
+        self.assertGreater(mapped['seq'], preview['seq'])
+        np.testing.assert_allclose(mapped['T_local_camera'][:3, 3], [3.1, 1., .6], atol=1e-6)
+
+    def test_raw_rgb_and_depth_diagnostics_update_without_pose_tf(self):
+        source = self.channels[0]
+        first_stamp = self._pair(source, (45, 100, 200), 1., (0., 0., 0.), omit_tf=True)
+        reports = []
+        def new_health(stamp):
+            def available():
+                try:
+                    report = source.health.get_nowait()
+                except queue.Empty:
+                    return False
+                if report.get('depth_preview_stamp_ns') == stamp and report.get('preview_stamp_ns') == stamp:
+                    reports.append(report)
+                    return True
+                return False
+            return available
+        self._wait(new_health(first_stamp), message='acquisition RGB/depth previews without TF')
+        second_stamp = self._pair(source, (180, 50, 90), 3., (0., 0., 0.), omit_tf=True)
+        self._wait(new_health(second_stamp), message='fresh acquisition previews despite held TF pair')
+        self.assertNotEqual(reports[0]['depth_preview_jpeg'], reports[1]['depth_preview_jpeg'])
+        self.assertNotEqual(reports[0]['preview_jpeg'], reports[1]['preview_jpeg'])
+        self.assertGreater(reports[1]['depth_preview_monotonic'], reports[0]['depth_preview_monotonic'])
+        self.assertEqual(reports[1]['depth_preview_registration'], 'depth_camera_native_grid')
+
+    def test_stalled_rgb_rebind_preserves_session_and_real_capture_timestamps(self):
+        from sensor_msgs.msg import CompressedImage
+        source = self.channels[0]
+        first_stamp = self._pair(source, (45, 100, 200), 1.3, (0., 0., 0.))
+        first = self._packet(source)
+        depth = CompressedImage()
+        depth.header.frame_id = 'camera'
+        depth.format = '16UC1; compressedDepth png'
+        _, payload = cv2.imencode('.png', np.full((32, 48), 1300, np.uint16))
+        depth.data = bytes(12) + payload.tobytes()
+        def depth_only_until_rebound():
+            depth.header.stamp = source.node.get_clock().now().to_msg()
+            source.depth.publish(depth)
+            h = self._health().get(source.robot['id'], {})
+            if not h.get('rgb_reader_awaiting_frame'):
+                return False
+            self.assertEqual(h['status'], 'rgb_stale')
+            self.assertEqual(h['rgb_reader_attempts'], 1)
+            self.assertEqual(h['rgb_reader_recoveries'], 0)
+            self.assertEqual(h['preview_stamp_ns'], first_stamp)
+            return True
+        self._wait(depth_only_until_rebound, timeout=17., message='stalled RGB reader rebind')
+        self._wait(lambda: source.rgb.get_subscription_count() == 1)
+        next_stamp = self._pair(source, (80, 160, 15), 1.6, (.4, .2, .1))
+        second = self._packet(source)
+        self.assertEqual(second['rgb_stamp_ns'], next_stamp)
+        self.assertEqual(second['session_id'], first['session_id'])
+        self.assertGreater(second['seq'], first['seq'])
+        self._wait(lambda: self._health().get(source.robot['id'], {}).get('rgb_reader_recoveries') == 1)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,12 @@ class FairLatestScheduler:
             if last and session != last[0]:
                 self.retired_sessions[robot].add(last[0])
             self.latest[robot] = (session, sequence)
+            queued = self.pending.get(robot)
+            if (packet.get('preview_only') and queued and queued['session_id'] == session
+                    and not queued.get('preview_only')
+                    and 0 <= self.clock()-queued['received_monotonic'] <= self.max_age_s):
+                # A pending frame with a measured pose can also produce previews.
+                return False
             self.counters[robot]['offered'] += 1
             if robot in self.pending:
                 self.counters[robot]['replaced'] += 1

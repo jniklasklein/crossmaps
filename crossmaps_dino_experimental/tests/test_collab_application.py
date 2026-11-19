@@ -2,9 +2,11 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import queue
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock
 
 import cv2
 import numpy as np
@@ -64,6 +66,42 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(state['mapping_status'], 'new_session_pending')
         self.assertFalse(state['aligned'])
         self.assertIsNone(state['T_world_local'])
+        self.assertIsNone(state['map_observation_age_s'])
+
+    def test_tf_missing_preview_does_not_advance_evidence_or_mapped_time(self):
+        self.pair()
+        packet = observations(1, self.config['robots'])[0]
+        old = self.app.snapshot()['robots'][0]
+        mapped = self.app.telemetry['rover_a']['last_mapped_monotonic']
+        self.app.offer(dict(packet, preview_only=True, T_local_camera=None,
+                            integration_allowed=False))
+        self.assertTrue(self.app.process_one())
+        new = self.app.snapshot()['robots'][0]
+        self.assertEqual(new['status'], 'waiting_for_tf')
+        self.assertEqual(old['frames'], new['frames'])
+        self.assertEqual(self.app.telemetry['rover_a']['last_mapped_monotonic'], mapped)
+        self.app.offer(dict(packet, seq=packet['seq']+1))
+        self.assertTrue(self.app.process_one())
+        self.assertEqual(self.app.snapshot()['robots'][0]['frames'], old['frames']+1)
+
+    def test_acquisition_feeds_and_recovery_are_independent_of_worker(self):
+        reports = queue.Queue()
+        self.app.adapters['rover_a'] = dict(process=Mock(), health=reports, output=queue.Queue())
+        self.addCleanup(self.app.adapters.clear)
+        now = time.monotonic()
+        reports.put(dict(status='waiting_for_tf', last_error='late TF',
+                         depth_preview_jpeg=b'depth bytes', depth_preview_monotonic=now-1))
+        self.app.poll_inputs()
+        self.assertEqual(self.app.image('rover_a', 'depth')[0], b'depth bytes')
+        state = self.app.snapshot()['robots'][0]
+        self.assertGreaterEqual(state['image_age_s']['depth'], 1.)
+        self.assertNotIn('depth_preview_jpeg', state['health'])
+        self.app.telemetry['rover_a'].update(status='processing_error', last_error='model unavailable')
+        reports.put(dict(status='receiving', last_error=None))
+        self.app.poll_inputs()
+        recovered = self.app.snapshot()['robots'][0]
+        self.assertIsNone(recovered['health']['last_error'])
+        self.assertEqual(recovered['last_error'], 'model unavailable')
 
     def test_repeated_camera_stamp_is_reported_stale_despite_fresh_callbacks(self):
         self.pair()

@@ -83,20 +83,119 @@ function modePresentation(snapshot) {
   return snapshot.shadow_mode !== false ? { label: "Live · shadow mode", style: "shadow" } : { label: "Live · automatic alignment", style: "verified" };
 }
 function imageAge(robot, view) {
-  if (finite(robot.image_age_s?.[view])) return robot.image_age_s[view];
-  return view === "rgb" ? robot.frame_age_s : robot.observation_age_s;
+  const age = robot.image_age_s?.[view];
+  if (finite(age) && age >= 0) return age;
+  // A recent observation does not mean this overlay was produced. In particular,
+  // pose rejection may keep SAM fresh while segments retain their last map frame.
+  return !robot.image_age_s && view === "rgb" && finite(robot.frame_age_s) ? robot.frame_age_s : null;
 }
 function orderedCandidates(snapshot) {
   const rank = (candidate) => { const constraint = candidateConstraint(candidate, snapshot); return constraint?.active ? 1 : ["verified", "corroborated"].includes(candidate.state) ? 0 : candidate.state === "rejected" ? 3 : 2; };
   return snapshot.candidates.slice().reverse().sort((a, b) => rank(a) - rank(b));
 }
-function healthState(robot) {
-  if (robot.error || robot.last_error || robot.health?.last_error || robot.perception?.error || ["error", "processing_error", "adapter_exited", "input_rejected"].includes(robot.status)) return "error";
-  if (robot.status === "pose_rejected" || robot.pose_quality?.integration_allowed === false || robot.perception?.status === "pose_rejected") return "pose_rejected";
-  if (robot.status === "capacity_reached") return "capacity_reached";
-  if (!finite(robot.frame_age_s)) return robot.status || "waiting";
-  if (robot.frame_age_s > 8) return "stale";
-  return "healthy";
+function currentComponent(robot, key) {
+  const value = robot[key] || {};
+  return value.session_id && robot.session_id && value.session_id !== robot.session_id ? {} : value;
+}
+function mappingPaused(robot) {
+  const perception = currentComponent(robot, "perception");
+  return robot.mapping_paused === true || robot.integration_allowed === false
+    || robot.pose_quality?.integration_allowed === false || perception.pose_quality?.integration_allowed === false
+    || [robot.status, robot.mapping_status, perception.status].some((value) => ["pose_rejected", "pose_inconsistent", "mapping_paused"].includes(value));
+}
+function healthPresentation(robot) {
+  const transport = currentComponent(robot, "health"), perception = currentComponent(robot, "perception");
+  const inputStatus = transport.status || "", status = robot.status || "";
+  const pose = perception.pose_quality || robot.pose_quality;
+  const poseReason = typeof pose === "object" && pose ? pose.status : pose;
+  const result = { state: "healthy", label: "Healthy", style: "healthy", detail: "",
+    input: inputStatus || (finite(robot.frame_age_s) ? "receiving" : "waiting_for_input"),
+    perception: perception.stage || perception.status || (status === "processing" ? "processing" : "waiting"),
+    mapping: mappingPaused(robot) ? "paused" : robot.mapping_status || "awaiting_observation" };
+  // Errors belong to the currently failing component; historical last_error
+  // strings must not paint a recovered source red forever.
+  if (robot.error || ["error", "processing_error", "adapter_exited"].includes(status)
+      || (perception.status === "error" && !(status === "healthy" && finite(robot.last_processed_stamp_ns)
+          && finite(perception.stamp_ns) && robot.last_processed_stamp_ns >= perception.stamp_ns))) {
+    return { ...result, state: "error", style: "error", label: status === "adapter_exited" ? "Adapter stopped" : "Perception error",
+      detail: robot.error || robot.last_error || perception.error || "Processing failed; inspect coordinator events." };
+  }
+  if (inputStatus === "rgb_stale" || (finite(robot.frame_age_s) && robot.frame_age_s > 8)) {
+    return { ...result, state: "stale", style: "stale", label: "Camera stale", mapping: "awaiting fresh RGB",
+      detail: inputStatus === "rgb_stale" ? `Compressed RGB stalled while depth advances. Reader retries: ${transport.rgb_reader_attempts ?? 0}. Waiting for a new camera timestamp.` : "No advancing camera timestamp; displayed images may be old." };
+  }
+  if (inputStatus === "waiting_for_tf" || poseReason === "timestamped_tf_unavailable") {
+    return { ...result, state: "waiting_for_tf", style: "pending", label: "Waiting for TF",
+      mapping: "paused", detail: transport.last_error || "Camera processing can continue; mapping waits for a valid image-time pose." };
+  }
+  if (inputStatus === "input_rejected" || status === "input_rejected") {
+    return { ...result, state: "input_rejected", style: "pending", label: "Input rejected",
+      detail: transport.last_error || "The latest input failed synchronization or calibration checks." };
+  }
+  if (inputStatus.startsWith("waiting_for_") || status === "waiting_for_input") {
+    return { ...result, state: inputStatus || status, style: "pending", label: (inputStatus || status).replaceAll("_", " "), detail: transport.last_error || "" };
+  }
+  if (mappingPaused(robot)) return { ...result, state: "mapping_paused", style: "pending", label: "Mapping paused", detail: String(poseReason || "Pose evidence is not currently safe to integrate.").replaceAll("_", " ") };
+  if ([status, robot.mapping_status].includes("capacity_reached")) return { ...result, state: "capacity_reached", style: "pending", label: "Evidence store full", detail: "New retained keyframes are paused; existing evidence is preserved." };
+  if (status === "recorded") return { ...result, state: "recorded", style: "supplied", label: "Recorded", mapping: "recorded evidence" };
+  if (!finite(robot.frame_age_s)) return { ...result, state: status || "waiting", style: "pending", label: (status || "Waiting").replaceAll("_", " ") };
+  if (status === "processing" || perception.status === "processing") return { ...result, state: "processing", style: "reference", label: "Processing" };
+  return result;
+}
+function healthState(robot) { return healthPresentation(robot).state; }
+function displayedImageAge(camera, nowMs) {
+  return finite(camera.displayedAge) && finite(camera.displayedAt) ? camera.displayedAge + Math.max(0, nowMs - camera.displayedAt) / 1000 : null;
+}
+function imageCaption(robot, view, { mode, preview = true, available = false, age = null } = {}) {
+  if (!available) return "No image for this view/session";
+  if (mode === "recorded_replay") return "Recorded observation · not live";
+  const mapped = ["segments", "entities"].includes(view);
+  const kind = view === "rgb" ? "Camera frame" : mapped ? "Last mapped overlay" : "Perception image";
+  const label = finite(age) ? `${ageLabel(age)} old` : "age unknown";
+  return `${preview ? "" : "Preview paused · "}${kind} · ${label}${mapped && mappingPaused(robot) ? " · mapping paused" : ""}`;
+}
+function shadowDescription(enabled) {
+  return enabled !== false
+    ? "Shadow mode keeps local perception and mapping running. Automatic cross-rover alignment and entity acceptance are off; existing and manually accepted links remain active."
+    : "Automatic cross-rover alignment and entity acceptance are enabled. Existing corroborated entity proposals can be accepted immediately; loop proposals need later corroboration. Robot localization is unchanged.";
+}
+function alignmentEvidence(snapshot) {
+  const candidates = snapshot.candidates || [], constraints = snapshot.constraints || [];
+  const supplied = snapshot.alignment_evidence || {};
+  const count = (key, fallback) => finite(supplied[key]) ? Math.max(0, Math.floor(supplied[key])) : fallback;
+  const retrieved = count("retrieved", candidates.length);
+  const checked = count("checked", candidates.filter((candidate) => candidate.verification && typeof candidate.verification.ok === "boolean").length);
+  const verified = count("verified", candidates.filter((candidate) => candidate.verification?.ok === true || ["verified", "corroborated", "accepted"].includes(candidate.state)).length);
+  const active = count("active", constraints.filter((constraint) => constraint.kind === "loop" && constraint.active).length);
+  const anchors = constraints.filter((constraint) => constraint.kind === "anchor" && constraint.active).length;
+  const failed = candidates.filter((candidate) => candidate.verification?.ok === false)
+    .sort((a, b) => (b.verification.inliers || 0) - (a.verification.inliers || 0));
+  const best = Object.hasOwn(supplied, "best_rejection") ? supplied.best_rejection : failed[0]?.verification;
+  let title, next;
+  if (active > 0 || anchors > 0) {
+    title = anchors > 0 && active === 0 ? "Supplied alignment active" : "Cross-rover alignment active";
+    next = "Object identity still needs its own aligned geometric and appearance evidence; alignment does not merge every segment.";
+  } else if (verified === 0) {
+    title = retrieved ? "First verified pair still needed" : "Waiting for overlapping keyframes";
+    next = "Retrieval similarity is not alignment confidence. First establish a geometrically verified overlapping pair; repeated stationary frames do not replace that check.";
+  } else if (snapshot.shadow_mode !== false) {
+    title = "Verified evidence awaiting a decision";
+    next = "Shadow mode prevents automatic acceptance. Inspect and explicitly accept verified evidence, or disable shadow and collect a second compatible match from a distinct viewpoint; moving one rover is sufficient for alignment corroboration.";
+  } else {
+    title = "Distinct-view corroboration still needed";
+    next = "Automatic alignment needs compatible verified matches from distinct viewpoints. Moving one rover is sufficient; both do not need to move. Stationary repeats or conflicting transforms do not count.";
+  }
+  const reasons = { insufficient_distinctive_mutual_matches: "too few distinctive visual matches", insufficient_correspondences: "too few matches with valid depth", insufficient_geometric_inliers: "too few consistent 3D matches", localized_or_ambiguous_correspondences: "correspondences are too localized or ambiguous", insufficient_depth_overlap: "insufficient depth overlap or excessive residual", icp_disagrees_with_visual_geometry: "depth refinement disagrees with visual geometry" };
+  const beforeFit = ["visual_features", "distinctive_matching", "depth_correspondences"].includes(best?.verification_stage);
+  const support = beforeFit ? ` · ${best.visual_matches ?? 0} visual matches; 3D fit not run` : finite(best?.inliers) ? ` · ${best.inliers} inliers` : "";
+  const rejection = best ? `${reasons[best.reason] || String(best.reason || "verification failed").replaceAll("_", " ")}${support}` : "";
+  return { retrieved, checked, verified, active, unchecked: Math.max(0, retrieved - checked), title, next, rejection,
+    scope: snapshot.alignment_evidence ? "Retained candidate pairs" : "Displayed candidate pairs" };
+}
+function candidateReason(candidate) {
+  return candidate.reason === "retrieved_not_verified" && !candidate.verification
+    ? "Not checked: this pair exceeded the per-keyframe verification budget. It is not a failed match or a verified alignment."
+    : candidate.reason || candidate.verification?.reason || "Awaiting geometric verification";
 }
 
 class WorldViewer {
@@ -148,7 +247,8 @@ function evidenceRenderKey(state) {
   // Camera ages change every poll; unchanged evidence must not replace focused
   // buttons/details in the DOM while an operator is reading or clicking them.
   return JSON.stringify([state.candidates, state.constraints, state.global_entities,
-    state.entity_links, state.events, state.stats, state.mode, state._dashboard?.commands_enabled]);
+    state.entity_links, state.events, state.stats, state.mode, state.shadow_mode,
+    state.alignment_evidence, state._dashboard?.commands_enabled]);
 }
 
 function startDashboard() {
@@ -167,22 +267,48 @@ function startDashboard() {
   }
   function renderRobots() {
     $("robots").innerHTML = snapshot.robots.map((robot, index) => {
-      const state = healthState(robot), timing = robot.timing || {}, health = robot.health || {}, perception = robot.perception || {}, id = robotId(robot);
+      const health = healthPresentation(robot), timing = robot.timing || {}, id = robotId(robot);
       const cycle = timing.cycle_avg_s ?? timing.cycle_s ?? (finite(timing.average_ms) ? timing.average_ms / 1000 : finite(timing.cycle_ms) ? timing.cycle_ms / 1000 : null);
       const pose = typeof robot.pose_quality === "object" && robot.pose_quality ? robot.pose_quality.status : robot.pose_quality;
-      const error = robot.error || robot.last_error || health.error || health.last_error || perception.error;
-      return `<article class="robot-card"><div class="robot-top"><div class="robot-name"><i class="source-dot ${index % 2 ? "violet" : ""}"></i>Rover ${escapeText(id)}</div><span class="badge ${["pose_rejected", "capacity_reached"].includes(state) ? "pending" : escapeText(state)}">${escapeText(state.replaceAll("_", " "))}</span></div><div class="robot-details"><div class="metric"><span>Camera age</span><strong>${ageLabel(robot.frame_age_s)}</strong></div><div class="metric"><span>Processed observation</span><strong>${ageLabel(robot.observation_age_s)}</strong></div><div class="metric"><span>Mean cycle</span><strong>${ageLabel(cycle)}</strong></div><div class="metric"><span>Keyframes / submaps</span><strong>${escapeText(robot.keyframes ?? robot.counts?.keyframes ?? 0)} / ${escapeText(robot.submaps ?? robot.counts?.submaps ?? 0)}</strong></div></div><div class="robot-meta">Domain ${escapeText(robot.domain ?? "—")} · ${escapeText(perception.stage || health.stage || robot.stage || robot.status || "Waiting for input")} · session ${escapeText(String(robot.session_id || "not received").slice(0, 18))}<br>${escapeText(pose || "External odometry; not validated")}</div>${error ? `<div class="robot-error">${escapeText(error)}</div>` : ""}</article>`;
+      return `<article class="robot-card"><div class="robot-top"><div class="robot-name"><i class="source-dot ${index % 2 ? "violet" : ""}"></i>Rover ${escapeText(id)}</div><span class="badge ${escapeText(health.style)}">${escapeText(health.label)}</span></div><div class="robot-details"><div class="metric"><span>Camera age</span><strong>${ageLabel(robot.frame_age_s)}</strong></div><div class="metric"><span>Perception completed</span><strong>${ageLabel(robot.observation_age_s)}</strong></div><div class="metric"><span>Last map integration</span><strong>${ageLabel(robot.map_observation_age_s)}</strong></div><div class="metric"><span>Mean cycle</span><strong>${ageLabel(cycle)}</strong></div><div class="metric"><span>Keyframes / submaps</span><strong>${escapeText(robot.keyframes ?? robot.counts?.keyframes ?? 0)} / ${escapeText(robot.submaps ?? robot.counts?.submaps ?? 0)}</strong></div></div><div class="robot-meta">Domain ${escapeText(robot.domain ?? "—")} · session ${escapeText(String(robot.session_id || "not received").slice(0, 18))}<br>Input: ${escapeText(health.input.replaceAll("_", " "))} · perception: ${escapeText(health.perception.replaceAll("_", " "))} · mapping: ${escapeText(health.mapping.replaceAll("_", " "))}<br>${escapeText(pose || "External odometry; not validated")}</div>${health.detail ? `<div class="${health.style === "error" ? "robot-error" : "robot-warning"}">${escapeText(health.detail)}</div>` : ""}</article>`;
     }).join("") || '<div class="robot-card muted">Waiting for rover configuration from the coordinator.</div>';
   }
+  function invalidateCamera(camera, message) {
+    camera.generation++; camera.controller?.abort();
+    if (camera.url) URL.revokeObjectURL(camera.url);
+    camera.url = null; camera.displayedAge = null; camera.displayedAt = null;
+    const img = camera.card.querySelector("img"); img.hidden = true; img.removeAttribute("src");
+    camera.card.querySelector(".camera-placeholder").hidden = false;
+    camera.card.querySelector(".camera-placeholder").textContent = message;
+    camera.card.querySelector("[data-image-status]").textContent = message;
+    camera.card.querySelector("[data-image-age]").textContent = "No image for this view/session";
+  }
+  function refreshCameraCaptions() {
+    for (const robot of snapshot.robots) {
+      const camera = cameraState.get(robotId(robot));
+      if (camera) camera.card.querySelector("[data-image-age]").textContent = imageCaption(robot, camera.view,
+        { mode: snapshot.mode, preview, available: Boolean(camera.url), age: displayedImageAge(camera, performance.now()) });
+    }
+  }
   function ensureCameras() {
-    const key = snapshot.robots.map(robotId).join("|"); if (key === robotKey) return; robotKey = key;
-    for (const camera of cameraState.values()) { camera.controller?.abort(); if (camera.url) URL.revokeObjectURL(camera.url); } cameraState.clear();
+    const key = snapshot.robots.map(robotId).join("|");
+    if (key === robotKey) {
+      for (const robot of snapshot.robots) {
+        const camera = cameraState.get(robotId(robot));
+        if (camera && camera.session !== robot.session_id) { camera.session = robot.session_id; invalidateCamera(camera, "New source session · waiting for selected view"); }
+      }
+      return;
+    }
+    robotKey = key;
+    for (const camera of cameraState.values()) invalidateCamera(camera, "Source list changed");
+    cameraState.clear();
     $("source-tabs").innerHTML = '<button data-source="combined">Combined</button>' + snapshot.robots.map((robot) => `<button data-source="${escapeText(robotId(robot))}">Rover ${escapeText(robotId(robot))}</button>`).join("");
     if (source !== "combined" && !snapshot.robots.some((robot) => robotId(robot) === source)) source = "combined";
     $("cameras").innerHTML = snapshot.robots.map((robot, i) => `<article class="camera-card" data-robot="${escapeText(robotId(robot))}"><div class="camera-header"><strong><i class="source-dot ${i % 2 ? "violet" : ""}"></i> Rover ${escapeText(robotId(robot))}</strong><div class="camera-controls"><select aria-label="Rover ${escapeText(robotId(robot))} camera view"><option value="rgb">RGB</option><option value="sam">SAM masks</option><option value="segments">Segments</option><option value="entities">Entities</option><option value="dino">DINO</option><option value="dino_similarity">DINO similarity</option><option value="clip">CLIP</option><option value="depth">Depth</option></select><button data-expand>Expand</button></div></div><div class="camera-image"><img alt="Rover ${escapeText(robotId(robot))} camera" hidden><span class="camera-placeholder">Waiting for first image</span></div><div class="camera-caption"><span data-image-status>Not received</span><span data-image-age></span></div></article>`).join("");
     for (const card of $("cameras").querySelectorAll(".camera-card")) {
-      const id = card.dataset.robot, camera = { card, view: "rgb", busy: false, generation: 0, url: null }; cameraState.set(id, camera);
-      card.querySelector("select").addEventListener("change", (event) => { camera.view = event.target.value; camera.generation++; camera.controller?.abort(); card.querySelector("img").hidden = true; card.querySelector(".camera-placeholder").hidden = false; card.querySelector(".camera-placeholder").textContent = "Loading selected view…"; });
+      const id = card.dataset.robot, camera = { card, view: "rgb", busy: false, generation: 0, url: null,
+        session: snapshot.robots.find((robot) => robotId(robot) === id)?.session_id, displayedAge: null, displayedAt: null }; cameraState.set(id, camera);
+      card.querySelector("select").addEventListener("change", (event) => { camera.view = event.target.value; invalidateCamera(camera, preview ? "Loading selected view…" : "Preview paused · resume to load selected view"); });
       card.querySelector("[data-expand]").addEventListener("click", () => fullscreen(card.querySelector(".camera-image")));
     }
     for (const id of ["anchor-robot", "anchor-reference"]) { const previous = $(id).value; $(id).innerHTML = snapshot.robots.map((robot) => `<option value="${escapeText(robotId(robot))}">Rover ${escapeText(robotId(robot))}</option>`).join(""); if (snapshot.robots.some((robot) => robotId(robot) === previous)) $(id).value = previous; }
@@ -190,17 +316,25 @@ function startDashboard() {
   }
   async function refreshCamera(id, camera) {
     if (!preview || document.hidden || camera.busy) return;
-    camera.busy = true; const generation = camera.generation; camera.controller = new AbortController(); const timeout = setTimeout(() => camera.controller.abort(), 7000); let url;
+    camera.busy = true; const generation = camera.generation, view = camera.view, started = performance.now();
+    const sourceAge = imageAge(snapshot.robots.find((robot) => robotId(robot) === id) || {}, view);
+    const controller = new AbortController(); camera.controller = controller;
+    const timeout = setTimeout(() => controller.abort(), 7000); let url;
     try {
-      const response = await fetch(`/api/image?robot=${encodeURIComponent(id)}&view=${encodeURIComponent(camera.view)}&seq=${sequence++}`, { cache: "no-store", signal: camera.controller.signal });
-      if (!response.ok) throw new Error(response.status === 404 ? "No image yet for this view" : `Image unavailable (${response.status})`);
+      const response = await fetch(`/api/image?robot=${encodeURIComponent(id)}&view=${encodeURIComponent(view)}&seq=${sequence++}`, { cache: "no-store", signal: controller.signal });
+      if (!response.ok) { const error = new Error(response.status === 404 ? "No image yet for this view/session" : `Image unavailable (${response.status})`); error.missing = response.status === 404; throw error; }
       const blob = await response.blob(); if (!blob.type.startsWith("image/")) throw new Error("Invalid camera response");
       url = URL.createObjectURL(blob); const decoded = new Image(); decoded.src = url; await decoded.decode();
       if (generation !== camera.generation || !preview) return;
       const img = camera.card.querySelector("img"), old = camera.url; img.src = url; img.hidden = false; camera.url = url; url = null; if (old) URL.revokeObjectURL(old);
+      camera.displayedAt = performance.now(); camera.displayedAge = finite(sourceAge) ? sourceAge + (camera.displayedAt - started) / 1000 : null;
       camera.card.querySelector(".camera-placeholder").hidden = true; camera.card.querySelector("[data-image-status]").textContent = `${camera.view.toUpperCase()} · ${decoded.naturalWidth} × ${decoded.naturalHeight}`;
+      refreshCameraCaptions();
     } catch (error) {
-      if (generation === camera.generation) { camera.card.querySelector("[data-image-status]").textContent = error.name === "AbortError" ? "Image request timed out" : error.message; if (camera.card.querySelector("img").hidden) camera.card.querySelector(".camera-placeholder").textContent = error.message; }
+      if (generation === camera.generation) {
+        if (error.missing) invalidateCamera(camera, error.message);
+        else if (preview) { camera.card.querySelector("[data-image-status]").textContent = error.name === "AbortError" ? "Image request timed out · keeping last frame" : error.message; if (camera.card.querySelector("img").hidden) camera.card.querySelector(".camera-placeholder").textContent = error.message; }
+      }
     } finally { if (url) URL.revokeObjectURL(url); clearTimeout(timeout); camera.busy = false; }
   }
   function renderMap() {
@@ -211,7 +345,7 @@ function startDashboard() {
     $("map-empty").hidden = cloud.positions.length > 0 && Boolean(viewer?.gl);
     $("map-empty").querySelector("h3").textContent = !viewer?.gl ? "WebGL is unavailable" : source === "combined" && cloud.excluded.length ? "Maps not aligned yet" : "Waiting for spatial evidence";
     $("map-empty").querySelector("p").textContent = !viewer?.gl ? "Camera feeds and evidence remain available. Enable WebGL to see the 3D map." : cloud.excluded.length ? "Choose a rover to inspect its local map. Unaligned submaps are never overlaid at a guessed origin." : "Selected keyframes and measured geometry will appear here.";
-    $("alignment-summary").textContent = source === "combined" ? `${cloud.excluded.length} unaligned submap(s) excluded. ${snapshot.shadow_mode !== false ? "Shadow mode: proposals do not automatically change alignment." : "Automatic acceptance enabled; inspect constraint evidence below."}` : "Local source geometry. This view does not imply cross-rover alignment or corrected odometry.";
+    $("alignment-summary").textContent = source === "combined" ? `${cloud.excluded.length} unaligned submap(s) excluded. ${snapshot.shadow_mode !== false ? "Shadow mode: local mapping continues; cross-rover matches require explicit acceptance." : "Automatic cross-rover acceptance enabled; inspect constraint evidence below."}` : "Local source geometry. This view does not imply cross-rover alignment or corrected odometry.";
     $("map-legend").innerHTML = snapshot.robots.map((robot, index) => `<span><i class="source-dot ${index % 2 ? "violet" : ""}"></i>Rover ${escapeText(robotId(robot))} · ${escapeText(robot.alignment_state || (robot.aligned ? "anchored" : "unaligned"))}</span>`).join("");
   }
   function renderEvidence() {
@@ -225,12 +359,14 @@ function startDashboard() {
     lastEvidenceKey = evidenceKey;
     const expanded = new Set(Array.from($("candidates").querySelectorAll("details[open]")).map((element) => element.dataset.key));
     const candidateScroll = $("candidates").scrollTop, eventScroll = $("events").scrollTop;
-    $("candidate-count").textContent = snapshot.candidates.length;
+    const alignment = alignmentEvidence(snapshot);
+    $("candidate-count").textContent = alignment.retrieved;
+    $("alignment-evidence").innerHTML = `<div class="evidence-metrics"><span>${escapeText(alignment.scope)}: <strong>${alignment.retrieved}</strong></span><span>Checked: <strong>${alignment.checked}</strong></span><span>Verified: <strong>${alignment.verified}</strong></span><span>Active constraints: <strong>${alignment.active}</strong></span></div><h3>${escapeText(alignment.title)}</h3><p>${escapeText(alignment.next)}</p>${alignment.rejection ? `<p>Best failed verification: ${escapeText(alignment.rejection)}.</p>` : ""}${alignment.unchecked ? `<p class="muted">${alignment.unchecked} pair(s) not checked within the verification budget. A high retrieval score alone cannot activate them.</p>` : ""}`;
     const anchorCards = snapshot.constraints.filter((constraint) => constraint.kind === "anchor" && constraint.active).map((constraint) => `<article class="evidence-card"><div class="evidence-title"><strong>Rover ${escapeText(constraint.robot_id || constraint.source)} → ${escapeText(constraint.reference_robot_id || constraint.target)}</strong><span class="badge supplied">Supplied anchor</span></div><p>Operator-provided alignment. This is not an automatic geometric match.</p><details data-key="${escapeText(constraint.id)}"><summary>Inspect supplied transform</summary><pre>${escapeText(JSON.stringify({ T_reference_local: constraint.T_reference_local, T_target_source: constraint.T_target_source }, null, 2))}</pre></details><div class="evidence-actions"><button data-action="reject_constraint" data-id="${escapeText(constraint.id)}">Undo supplied anchor</button></div></article>`).join("");
     const candidateCards = orderedCandidates(snapshot).slice(0, 100).map((candidate) => {
       const verification = candidate.verification || {}, constraint = candidateConstraint(candidate, snapshot), transform = candidate.transform || constraint?.T_target_source || verification.T_target_source;
       const state = constraint?.active ? constraint.state || "accepted" : candidate.state || "proposed";
-      return `<article class="evidence-card"><div class="evidence-title"><strong>${escapeText(candidate.source_robot ? `Rover ${candidate.source_robot}` : candidate.source)} ↔ ${escapeText(candidate.target_robot ? `Rover ${candidate.target_robot}` : candidate.target)}</strong><span class="badge ${escapeText(state)}">${escapeText(state)}</span></div><p>${escapeText(candidate.reason || verification.reason || "Awaiting geometric verification")}</p><div class="evidence-metrics"><span>Retrieval ${numberLabel(candidate.score)}</span><span>Inliers ${escapeText(verification.inliers ?? verification.inlier_count ?? candidate.inliers ?? "—")}</span><span>RMSE ${numberLabel(verification.rmse ?? candidate.rmse, 3)} m</span><span>Corroborations ${escapeText(constraint?.corroborations ?? 0)}</span></div><details data-key="${escapeText(candidate.id)}"><summary>Inspect evidence and transform</summary><pre>${escapeText(JSON.stringify({ source: candidate.source, target: candidate.target, cues: candidate.cues, verification, T_target_source: transform }, null, 2))}</pre></details>${constraint ? `<div class="evidence-actions">${!constraint.active && !["rejected", "invalid"].includes(constraint.state) ? `<button data-action="accept_constraint" data-id="${escapeText(constraint.id)}">Accept verified constraint</button>` : ""}<button data-action="reject_constraint" data-id="${escapeText(constraint.id)}">${constraint.active ? "Undo constraint" : "Reject constraint"}</button></div>` : ""}</article>`;
+      return `<article class="evidence-card"><div class="evidence-title"><strong>${escapeText(candidate.source_robot ? `Rover ${candidate.source_robot}` : candidate.source)} ↔ ${escapeText(candidate.target_robot ? `Rover ${candidate.target_robot}` : candidate.target)}</strong><span class="badge ${escapeText(state)}">${escapeText(state)}</span></div><p>${escapeText(candidateReason(candidate))}</p><div class="evidence-metrics"><span>Retrieval score ${numberLabel(candidate.score)} · not confidence</span><span>Inliers ${escapeText(verification.inliers ?? verification.inlier_count ?? candidate.inliers ?? "—")}</span><span>RMSE ${numberLabel(verification.rmse ?? candidate.rmse, 3)} m</span><span>Corroborations ${escapeText(constraint?.corroborations ?? 0)}</span></div><details data-key="${escapeText(candidate.id)}"><summary>Inspect evidence and transform</summary><pre>${escapeText(JSON.stringify({ source: candidate.source, target: candidate.target, cues: candidate.cues, verification, T_target_source: transform }, null, 2))}</pre></details>${constraint ? `<div class="evidence-actions">${!constraint.active && !["rejected", "invalid"].includes(constraint.state) ? `<button data-action="accept_constraint" data-id="${escapeText(constraint.id)}">Accept verified constraint</button>` : ""}<button data-action="reject_constraint" data-id="${escapeText(constraint.id)}">${constraint.active ? "Undo constraint" : "Reject constraint"}</button></div>` : ""}</article>`;
     });
     $("candidates").innerHTML = candidateCards.slice(0, 8).join("") || '<div class="empty-list">No cross-rover candidates yet.<br>Distinct keyframes and overlapping places are needed before verification.</div>';
     if (candidateCards.length > 8) $("candidates").insertAdjacentHTML("beforeend", `<details data-key="additional-candidates"><summary>Show ${candidateCards.length - 8} more candidates and rejected matches</summary>${candidateCards.slice(8).join("")}</details>`);
@@ -260,10 +396,11 @@ function startDashboard() {
       snapshot = normalizeSnapshot(await response.json()); connected = true; $("connection").textContent = `Coordinator connected · ${snapshot.robots.length} rover sources`; $("connection-dot").classList.add("online");
       const mode = modePresentation(snapshot); $("mode-badge").textContent = mode.label; $("mode-badge").className = `badge ${mode.style}`;
       $("shadow").checked = snapshot.shadow_mode !== false; $("shadow").disabled = !snapshot._dashboard?.commands_enabled;
+      $("shadow-explanation").textContent = shadowDescription(snapshot.shadow_mode);
       renderRobots(); ensureCameras(); renderEvidence();
       const key = JSON.stringify([snapshot.revision, source, $("color-mode").value, $("budget").value, snapshot.submaps.map((s) => [s.id, s.aligned, s.pose_version, s.points?.length])]);
       if (key !== lastRenderKey || snapshot.revision === undefined) { renderMap(); lastRenderKey = key; }
-      for (const robot of snapshot.robots) { const camera = cameraState.get(robotId(robot)); if (camera) camera.card.querySelector("[data-image-age]").textContent = snapshot.mode === "recorded_replay" ? "Recorded observation · not live" : `Source age ${ageLabel(imageAge(robot, camera.view))}`; }
+      refreshCameraCaptions();
     } catch (error) { connected = false; $("connection-dot").classList.remove("online"); $("connection").textContent = `Disconnected · ${error.message}`; for (const button of document.querySelectorAll("[data-action], #save, #anchor-form button")) button.disabled = true; $("shadow").disabled = true; for (const camera of cameraState.values()) camera.card.querySelector("[data-image-age]").textContent = "Age unknown · coordinator disconnected"; }
     finally { pollBusy = false; }
   }
@@ -274,14 +411,14 @@ function startDashboard() {
   $("fit").addEventListener("click", () => viewer?.fit()); $("top").addEventListener("click", () => { if (viewer) { viewer.pitch = 1.56; viewer.yaw = -Math.PI / 2; viewer.fit(); } });
   $("map-fullscreen").addEventListener("click", () => fullscreen(document.querySelector(".map-panel")));
   $("help-toggle").addEventListener("click", () => { $("help").hidden = !$("help").hidden; $("help-toggle").setAttribute("aria-expanded", String(!$("help").hidden)); });
-  $("preview-toggle").addEventListener("click", () => { preview = !preview; $("preview-toggle").textContent = preview ? "Pause preview" : "Resume preview"; $("preview-toggle").setAttribute("aria-pressed", String(preview)); for (const camera of cameraState.values()) if (!preview) camera.controller?.abort(); });
+  $("preview-toggle").addEventListener("click", () => { preview = !preview; $("preview-toggle").textContent = preview ? "Pause preview" : "Resume preview"; $("preview-toggle").setAttribute("aria-pressed", String(preview)); for (const camera of cameraState.values()) if (!preview) { camera.generation++; camera.controller?.abort(); } refreshCameraCaptions(); });
   $("save").addEventListener("click", () => command({ action: "save" }).catch((error) => notify(error.message, true)));
-  $("shadow").addEventListener("change", async () => { const enabled = $("shadow").checked; if (!enabled && !window.confirm("Allow the coordinator to commit automatically verified alignments? This changes the shared map. It does not change robot localization.")) { $("shadow").checked = true; return; } try { await command({ action: "set_shadow_mode", enabled }); } catch (error) { $("shadow").checked = snapshot.shadow_mode !== false; notify(error.message, true); } });
+  $("shadow").addEventListener("change", async () => { const enabled = $("shadow").checked; if (!enabled && !window.confirm("Enable automatic acceptance of corroborated cross-rover alignments and entity links? Existing corroborated entity proposals may be accepted immediately. This changes the shared world model, not robot localization.")) { $("shadow").checked = true; return; } try { await command({ action: "set_shadow_mode", enabled }); } catch (error) { $("shadow").checked = snapshot.shadow_mode !== false; notify(error.message, true); } });
   document.addEventListener("click", async (event) => { const button = event.target.closest("[data-action]"); if (!button) return; if (!window.confirm(`${button.textContent}? Local observations will be preserved.`)) return; button.disabled = true; try { await command({ action: button.dataset.action, id: button.dataset.id }); } catch (error) { notify(error.message, true); button.disabled = false; } });
   $("anchor-form").addEventListener("submit", async (event) => { event.preventDefault(); try { const robot = $("anchor-robot").value, reference = $("anchor-reference").value; if (!robot || !reference || robot === reference) throw new Error("Choose two different rover frames."); const transform = anchorTransform(...["x", "y", "z", "yaw"].map((axis) => Number($("anchor-" + axis).value))); if (!window.confirm(`Apply a SUPPLIED alignment from ${robot} into ${reference}? Confirm these are measured frame offsets, not guessed robot positions.`)) return; await command({ action: "anchor", robot_id: robot, reference_robot_id: reference, T_reference_local: transform }); } catch (error) { notify(error.message, true); } });
   const tick = async () => { await poll(); setTimeout(tick, 1000); }; tick();
   const images = () => { for (const [id, camera] of cameraState) refreshCamera(id, camera); setTimeout(images, 1000); }; images();
 }
 
-if (typeof module !== "undefined" && module.exports) module.exports = { robotId, escapeText, ageLabel, matrix, transformPoint, inverseRigid, matrixProduct, anchorTransform, normalizeSnapshot, buildCloud, candidateConstraint, activeEntityLink, modePresentation, imageAge, orderedCandidates, healthState, evidenceRenderKey };
+if (typeof module !== "undefined" && module.exports) module.exports = { robotId, escapeText, ageLabel, matrix, transformPoint, inverseRigid, matrixProduct, anchorTransform, normalizeSnapshot, buildCloud, candidateConstraint, activeEntityLink, modePresentation, imageAge, orderedCandidates, currentComponent, mappingPaused, healthPresentation, healthState, displayedImageAge, imageCaption, shadowDescription, alignmentEvidence, candidateReason, evidenceRenderKey };
 if (typeof document !== "undefined") { if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", startDashboard); else startDashboard(); }

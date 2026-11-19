@@ -20,7 +20,7 @@ DEFAULT_CONFIG = {
         "stationary_pose_lock": False,
     }},
     "pose_guard": {
-        "enabled": True, "max_translation_error_m": 0.15,
+        "enabled": True, "rgbd_recovery": True, "max_translation_error_m": 0.15,
         "max_rotation_error_deg": 5.0, "max_speed_m_s": 2.0,
         "max_yaw_rate_deg_s": 150.0,
     },
@@ -127,8 +127,9 @@ def validate_config(config):
             raise ValueError("robot parameters must be an object")
         config["robots"][i] = robot
     guard = config['pose_guard']
-    if not isinstance(guard['enabled'], bool):
-        raise ValueError('pose_guard.enabled must be boolean')
+    for flag in ('enabled', 'rgbd_recovery'):
+        if not isinstance(guard[flag], bool):
+            raise ValueError(f'pose_guard.{flag} must be boolean')
     for name, bounds in {'max_translation_error_m': (.01, 10),
                          'max_rotation_error_deg': (.1, 90),
                          'max_speed_m_s': (.01, 20),

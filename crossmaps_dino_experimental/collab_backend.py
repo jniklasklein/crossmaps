@@ -249,10 +249,13 @@ class Backend:
                 submap['T_world_submap'] = previous['T_world_submap'] @ np.linalg.inv(previous['T_local_submap']) @ submap['T_local_submap']
                 submap['aligned'] = previous['aligned']
                 edge_id = identifier('odometry', previous['id'], submap_id)
+                endpoint_quality = (self.keyframes[previous['keyframe_ids'][0]].get('pose_quality'), obs.get('pose_quality'))
+                has_recovery = any(isinstance(q, dict) and q.get('mapping_pose_corrected') for q in endpoint_quality)
                 self.constraints[edge_id] = dict(id=edge_id, source=submap_id, target=previous['id'],
                     T_target_source=np.linalg.inv(previous['T_local_submap']) @ submap['T_local_submap'],
                     kind='odometry', state='accepted', active=True, translation_sigma=.10, rotation_sigma=math.radians(8),
-                    provenance='external_odometry_not_validated', corroborations=0)
+                    provenance='local_pose_with_rgbd_recovery' if has_recovery else 'external_odometry_not_validated',
+                    corroborations=0)
             self.submaps[submap_id] = submap
             source['submap_ids'].append(submap_id)
         obs['id'] = identifier('keyframe', robot, session, obs['seq'])
@@ -311,12 +314,30 @@ class Backend:
             for target, scores in ranked[:self.config['candidate_top_k']]:
                 selected[target['id']] = (target, scores)
         ranked = sorted(selected.values(), key=lambda item: (-max(item[1].values()), item[0]['id']))
+        # Retain the strongest retrieval slot. With a second slot, also test
+        # a recent view from the other *current* adapter session. A near-1 CLIP
+        # score for a bin used to monopolize both slots with old, nearly
+        # identical target frames. Coordinator receipt time is a cheap proposal
+        # only: not cross-robot clock sync, pose evidence, or corroboration.
+        received = observation.get('received_monotonic')
+        recent_id = None
+        if len(ranked) and self.config['verifications_per_keyframe'] >= 2 and received is not None:
+            recent = [(target, cues) for target, cues in pool
+                      if self.robots.get(target['robot_id']) == target['source_id']
+                      and target.get('received_monotonic') is not None
+                      and abs(target['received_monotonic']-received) <= self.config['keyframe_seconds']*2]
+            if recent:
+                latest = min(recent, key=lambda pair: (abs(pair[0]['received_monotonic']-received), pair[0]['id']))
+                recent_id = latest[0]['id']
+                if recent_id != ranked[0][0]['id']:
+                    ranked = [ranked[0], latest, *(item for item in ranked[1:] if item[0]['id'] != recent_id)]
         for index, (target, scores) in enumerate(ranked):
             candidate_id = identifier('candidate', observation['id'], target['id'])
             candidate = dict(id=candidate_id, source=observation['id'], target=target['id'],
                              source_robot=observation['robot_id'], target_robot=target['robot_id'],
                              source_submap=observation['submap_id'], target_submap=target['submap_id'],
-                             state='proposed', score=max(scores.values()), cues=scores, reason='retrieved_not_verified')
+                             state='proposed', score=max(scores.values()), cues=scores, reason='retrieved_not_verified',
+                             proposal_basis='recent_local_receipt_and_retrieval' if recent_id == target['id'] else 'retrieval')
             self.candidates[candidate_id] = candidate
             if index >= self.config['verifications_per_keyframe']:
                 continue
@@ -335,7 +356,8 @@ class Backend:
                         T_targetcamera_sourcecamera=verification['T_target_source'].copy(),
                         kind='loop', state='verified', active=False, corroborations=1,
                         translation_sigma=verification['translation_sigma'], rotation_sigma=verification['rotation_sigma'],
-                        provenance='rgbd_ransac_icp', source_session=observation['source_id'], target_session=target['source_id'])
+                        provenance='rgbd_'+verification.get('seed_method', 'depth_ransac'),
+                        matcher=verification.get('matcher'), source_session=observation['source_id'], target_session=target['source_id'])
             self.constraints[candidate_id] = edge
             candidate.update(state='verified', constraint_id=candidate_id)
             self._corroborate(edge)
@@ -345,6 +367,7 @@ class Backend:
 
     def _corroborate(self, edge):
         first = self.keyframes[edge['source_frame']]
+        second = self.keyframes[edge['target_frame']]
         witnesses = [edge]
         for previous in self.constraints.values():
             if previous is edge or previous.get('kind') != 'loop' or previous.get('state') == 'rejected':
@@ -359,11 +382,13 @@ class Backend:
             distance, angle = pose_delta(relation, edge['T_targetlocal_sourcelocal'])
             if distance > self.config['transform_agreement_translation'] or angle > math.radians(self.config['transform_agreement_rotation_deg']):
                 continue
-            old_frame_id = previous['source_frame'] if same else previous['target_frame']
-            old = self.keyframes.get(old_frame_id)
-            if old is None:
-                continue
-            if not self._distinct_views(old, first):
+            old_source, old_target = previous['source_frame'], previous['target_frame']
+            if reverse:
+                old_source, old_target = old_target, old_source
+            # A changed, pose-supported view on either rover supplies a new
+            # observation, independent of which rover triggered retrieval.
+            if not (self._distinct_views(self.keyframes[old_source], first) or
+                    self._distinct_views(self.keyframes[old_target], second)):
                 continue
             witnesses.append(previous)
         if len(witnesses) >= 2:
@@ -679,8 +704,24 @@ class Backend:
                 keyframe_count=len(submap['keyframe_ids']), aligned=submap['aligned'],
                 T_world_submap=submap['T_world_submap'], T_local_submap=submap['T_local_submap'],
                 points=submap['points'][indices], colors=submap['colors'][indices]))
+        # The review list is paged to 100 items. Count retained candidates for
+        # the current sessions before truncation so the summary explains the run.
+        current = set(self.robots.values())
+        candidates = [c for c in self.candidates.values() if all(
+            self.keyframes.get(c[end], {}).get('source_id') in current for end in ('source', 'target'))]
+        checked = [c['verification'] for c in candidates if 'verification' in c]
+        failed = [v for v in checked if not v['ok']]
+        best = max(failed, key=lambda v: (v.get('visual_inliers', v.get('inliers', 0)),
+                                          v.get('depth_correspondences', 0), v.get('visual_matches', 0)), default=None)
+        active = sum(e['kind']=='loop' and e['active'] for e in self.constraints.values()
+                     if e.get('source_session') in current and e.get('target_session') in current)
+        evidence = dict(retrieved=len(candidates), checked=len(checked), verified=sum(v['ok'] for v in checked),
+                        active=active, best_rejection=None if best is None else dict(
+                            reason=best['reason'], inliers=best.get('visual_inliers', best.get('inliers', 0)),
+                            **{k: best[k] for k in ('visual_matches', 'verification_stage', 'matcher') if k in best}))
         return plain(dict(schema='crossmaps_collaborative_v1', revision=self.revision, shadow_mode=self.config['shadow_mode'],
             reference_session=self.reference_session, robots=robots, submaps=maps,
+            alignment_evidence=evidence,
             candidates=list(self.candidates.values())[-100:], constraints=list(self.constraints.values()),
             global_entities=self._entity_cache, entity_links=list(self.entity_links.values()), entity_aliases=self.entity_aliases,
             pending_anchors=self.pending_anchors, events=list(self.events),

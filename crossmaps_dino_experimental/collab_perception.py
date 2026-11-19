@@ -80,13 +80,19 @@ def validate_observation(observation):
     rgb = np.asarray(observation["rgb"])
     depth = np.asarray(observation["depth"], dtype=np.float32)
     K = np.asarray(observation["K"], dtype=np.float64).reshape(3, 3)
-    T = np.asarray(observation["T_local_camera"], dtype=np.float64)
+    preview_only = observation.get("preview_only", False)
+    if not isinstance(preview_only, bool):
+        raise ValueError("preview_only must be an explicit boolean")
+    transform = observation.get("T_local_camera")
+    T = None if transform is None and preview_only else np.asarray(transform, dtype=np.float64)
     if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError("rgb must be HxWx3 BGR uint8")
     if depth.shape != rgb.shape[:2]:
         raise ValueError("Depth must already be registered to RGB pixel coordinates")
     if not np.isfinite(K).all() or K[0, 0] <= 0 or K[1, 1] <= 0:
         raise ValueError("Invalid camera intrinsics")
+    if T is None:
+        return rgb, depth, K, T
     if T.shape != (4, 4) or not np.isfinite(T).all():
         raise ValueError("Invalid T_local_camera")
     if (not np.allclose(T[3], [0, 0, 0, 1], atol=1e-6)
@@ -114,19 +120,24 @@ class PoseConsistencyGuard:
     """Conservative contradiction detector, NOT odometry or a stationary lock.
 
     A retained RGB-D anchor makes accumulated yaw drift detectable while the
-    scene remains visible. Unverifiable input is explicitly unvalidated. A
-    contradiction pauses fusion; it never substitutes an invented pose.
+    scene remains visible. Recovery is bounded registration to that anchor,
+    never an unchecked visual-odometry chain or a stationary pose substitute.
     """
     def __init__(self, rotation_deg=5., translation_m=.15, *, enabled=True,
-                 max_speed_m_s=2., max_yaw_rate_deg_s=150.):
+                 max_speed_m_s=2., max_yaw_rate_deg_s=150., rgbd_recovery=True):
         self.rotation_deg = float(rotation_deg)
         self.translation_m = float(translation_m)
         self.enabled = bool(enabled)
         self.max_speed_m_s = float(max_speed_m_s)
         self.max_yaw_rate_deg_s = float(max_yaw_rate_deg_s)
+        self.rgbd_recovery = bool(rgbd_recovery)
         self.anchor = None
         self.previous_pose = None
+        self.previous_external_pose = None
         self.revalidation_required = False
+        self.visual_tracking_active = False
+        self.recovery_hits = 0
+        self.recovery_candidate = None
         self.orb = cv2.ORB_create(nfeatures=900)
 
     def _features(self, rgb, depth, K, T):
@@ -143,8 +154,129 @@ class PoseConsistencyGuard:
         z = depth[pix[:, 1], pix[:, 0]]
         points = np.column_stack(((pixels[:, 0] - K[0, 2]) * z / K[0, 0],
                                   (pixels[:, 1] - K[1, 2]) * z / K[1, 1], z))
+        dense, u, v = depth_points(depth, K, max(8, int(math.ceil(max(depth.shape)/64))))
+        smooth = cv2.GaussianBlur(gray, (5, 5), 0)
+        values = cv2.remap(smooth, (u*scale).astype(np.float32).reshape(-1, 1),
+                           (v*scale).astype(np.float32).reshape(-1, 1), cv2.INTER_LINEAR).reshape(-1) if len(u) else np.zeros(0)
         return dict(pixels=pixels, descriptors=descriptors, points=points,
-                    T=T.copy(), K=K.copy(), shape=depth.shape)
+                    T=T.copy(), K=K.copy(), shape=depth.shape, dense_points=dense,
+                    dense_gray=values, gray=smooth, scale=scale)
+
+    @staticmethod
+    def _recovery_evidence(reference, current, matches, ids, visual, depth, K):
+        """Independent 3D and dense hold-out checks; PnP count is not enough."""
+        evidence = {"recovery_validated": False}
+        if (len(ids) < 60 or len(ids)/max(1, len(matches)) < .7
+                or len({matches[i].trainIdx for i in ids}) < 60):
+            return {**evidence, "recovery_reason": "insufficient_correspondences"}
+        a = np.asarray([reference["points"][matches[i].queryIdx] for i in ids])
+        b = np.asarray([current["points"][matches[i].trainIdx] for i in ids])
+        uv = np.asarray([current["pixels"][matches[i].trainIdx] for i in ids])
+        transformed = a @ visual[:3, :3].T + visual[:3, 3]
+        errors = np.linalg.norm(transformed-b, axis=1)
+        valid = np.isfinite(b).all(axis=1) & (b[:, 2] > .2) & (b[:, 2] < 8.)
+        if np.count_nonzero(valid) < 60:
+            return {**evidence, "recovery_reason": "insufficient_independent_depth"}
+        tolerance = .06 + .02*float(np.median(b[valid, 2]))
+        good = valid & (errors < tolerance)
+        evidence.update(rgbd_depth_support_fraction=float(np.mean(good)),
+                        rgbd_median_error_m=float(np.median(errors[valid])))
+        if np.count_nonzero(good) < 60 or np.mean(good) < .75 or np.median(errors[good]) > .045:
+            return {**evidence, "recovery_reason": "3d_correspondence_conflict"}
+        xyz, pixels = a[good], uv[good]
+        extent = np.ptp(pixels, axis=0)/[depth.shape[1], depth.shape[0]]
+        bins = np.floor(pixels/[depth.shape[1], depth.shape[0]]*[4, 3]).astype(int)
+        cells = len(set(map(tuple, bins)))
+        singular = np.linalg.svd(xyz-xyz.mean(axis=0), compute_uv=False)
+        ratio = float(singular[-1]/max(1e-8, singular[0]))
+        depth_range = float(np.quantile(xyz[:, 2], .9)-np.quantile(xyz[:, 2], .1))
+        evidence.update(rgbd_support_cells=cells, rgbd_support_span_fraction=extent.tolist(), rgbd_depth_range_m=depth_range,
+                        rgbd_nonplanarity_ratio=ratio)
+        if extent[0] < .65 or extent[1] < .4 or cells < 6 or depth_range < .25 or ratio < .02:
+            return {**evidence, "recovery_reason": "support_not_distributed_at_multiple_depths"}
+        # Validate on a regular depth grid not used by the feature fit. This
+        # rejects a moving textured foreground whose background disagrees.
+        dense = reference["dense_points"]
+        projected = dense @ visual[:3, :3].T + visual[:3, 3]
+        positive = projected[:, 2] > .2
+        uv_dense = projected[:, :2]/np.maximum(projected[:, 2, None], .01)*[K[0, 0], K[1, 1]]+[K[0, 2], K[1, 2]]
+        rounded = np.rint(uv_dense).astype(int)
+        inside = positive & (rounded[:, 0] >= 0) & (rounded[:, 0] < depth.shape[1]) & (rounded[:, 1] >= 0) & (rounded[:, 1] < depth.shape[0])
+        selected = np.flatnonzero(inside)
+        measured = depth[rounded[selected, 1], rounded[selected, 0]]
+        good_depth = np.isfinite(measured) & (measured > .2) & (measured < 8.)
+        selected, measured = selected[good_depth], measured[good_depth]
+        if len(selected) < 200 or len(selected)/max(1, len(dense)) < .6:
+            return {**evidence, "recovery_reason": "insufficient_dense_overlap"}
+        depth_agrees = np.abs(measured-projected[selected, 2]) < .08+.015*measured
+        sampled = cv2.remap(current["gray"], (uv_dense[selected, 0]*current["scale"]).astype(np.float32).reshape(-1, 1),
+                            (uv_dense[selected, 1]*current["scale"]).astype(np.float32).reshape(-1, 1), cv2.INTER_LINEAR).reshape(-1)
+        difference = sampled.astype(float)-reference["dense_gray"][selected].astype(float)
+        difference -= np.median(difference)  # Global exposure offset is not motion.
+        photo_agrees = np.abs(difference) < 25.
+        joint = float(np.mean(depth_agrees & photo_agrees))
+        evidence.update(rgbd_dense_samples=len(selected), rgbd_dense_agreement=joint,
+                        rgbd_photometric_median=float(np.median(np.abs(difference))))
+        if joint < .70 or np.mean(photo_agrees) < .85:
+            return {**evidence, "recovery_reason": "background_or_dense_geometry_conflict"}
+        return {**evidence, "recovery_validated": True, "recovery_reason": "distributed_rgbd_and_background_support"}
+
+    def _recover(self, reference, current, matches, ids, visual, depth, K, T, stamp_ns, result):
+        evidence = self._recovery_evidence(reference, current, matches, ids, visual, depth, K)
+        result.update(evidence)
+        candidate = reference["T"] @ np.linalg.inv(visual)
+        correction = np.linalg.inv(T) @ candidate
+        resume_external = (self.visual_tracking_active and result["recovery_validated"]
+                           and not result.get("external_pose_discontinuity", False)
+                           and _rotation_angle(correction) <= .5
+                           and np.linalg.norm(correction[:3, 3]) <= .02)
+        # Bounded local registration, not chained VO: preserve the trusted
+        # anchor and stop when it is no longer sufficiently observable. A raw
+        # pose independently revalidated against this anchor may resume, with
+        # the same continuity check below, without starting a corrected chain.
+        if not resume_external and (np.linalg.norm(visual[:3, 3]) > .4 or _rotation_angle(visual) > 15.):
+            result.update(recovery_validated=False, recovery_reason="outside_trusted_anchor_window")
+        if not result["recovery_validated"] or stamp_ns is None:
+            self.recovery_hits, self.recovery_candidate = 0, None
+            result.update(integration_allowed=False, recovery_confirmations=0)
+            return result
+        stamp_ns = int(stamp_ns)
+        old = self.recovery_candidate
+        if old is not None and stamp_ns <= old[0]:
+            result.update(integration_allowed=False, recovery_reason="duplicate_recovery_observation",
+                          recovery_confirmations=self.recovery_hits)
+            return result
+        continuous = True
+        if old is not None:
+            dt = (stamp_ns-old[0])*1e-9
+            motion = np.linalg.inv(old[1]) @ candidate
+            continuous = (dt <= 30. and np.linalg.norm(motion[:3, 3]) <= .03+self.max_speed_m_s*dt
+                          and _rotation_angle(motion) <= 1.+self.max_yaw_rate_deg_s*dt)
+        self.recovery_hits = min(3, self.recovery_hits+1) if old is not None and continuous else 1
+        self.recovery_candidate = (stamp_ns, candidate)
+        result["recovery_confirmations"] = self.recovery_hits
+        if self.recovery_hits < 3:
+            result.update(integration_allowed=False, status="rgbd_recovery_pending")
+            return result
+        # Do not switch between a corrected pose and a raw pose merely because
+        # raw odometry falls back inside the much looser contradiction gate.
+        # Return only after the same independent evidence supports near-equality
+        # and the raw source itself has no abrupt discontinuity this frame.
+        if resume_external:
+            self.visual_tracking_active = False
+            self.recovery_hits, self.recovery_candidate = 0, None
+            result.update(integration_allowed=True, status="visual_pose_consistent",
+                          pose_source="external_tf_rgbd_revalidated", recovery_confirmations=0,
+                          resumed_external_pose=True)
+            return result
+        self.visual_tracking_active = True
+        result.update(integration_allowed=True, status="visual_rgbd_recovered",
+                      pose_source="validated_rgbd_trusted_anchor", mapping_pose_corrected=True,
+                      external_T_local_camera=T.tolist(), corrected_T_local_camera=candidate.tolist(),
+                      anchor_stamp_ns=reference.get("stamp_ns"),
+                      correction_rotation_deg=_rotation_angle(correction),
+                      correction_translation_m=float(np.linalg.norm(correction[:3, 3])))
+        return result
 
     @staticmethod
     def compare(reference_T, current_T, visual_current_reference, rotation_deg=8., translation_m=.25):
@@ -159,13 +291,16 @@ class PoseConsistencyGuard:
 
     def check(self, rgb, depth, K, T, stamp_ns=None):
         unvalidated = {"integration_allowed": True, "status": "external_tf_not_validated",
-                       "is_localization_fix": False, "guard_enabled": self.enabled}
+                       "is_localization_fix": False, "guard_enabled": self.enabled,
+                       "rgbd_recovery_enabled": self.rgbd_recovery}
         if not self.enabled:
             return unvalidated
-        if self.revalidation_required:
+        blocked = self.revalidation_required or self.visual_tracking_active
+        if blocked:
             unvalidated.update(integration_allowed=False, status="pose_revalidation_required")
-        if stamp_ns is not None and self.previous_pose is not None:
-            previous_stamp, previous_T = self.previous_pose
+        discontinuity = {}
+        if stamp_ns is not None and self.previous_external_pose is not None:
+            previous_stamp, previous_T = self.previous_external_pose
             dt = (int(stamp_ns) - previous_stamp) * 1e-9
             if dt > 0.:
                 delta = np.linalg.inv(previous_T) @ T
@@ -173,27 +308,40 @@ class PoseConsistencyGuard:
                 rotation_rate = _rotation_angle(delta) / dt
                 if speed > self.max_speed_m_s or rotation_rate > self.max_yaw_rate_deg_s:
                     self.revalidation_required = True
-                    return {"integration_allowed": False, "status": "external_pose_discontinuity",
-                            "speed_m_s": speed, "rotation_rate_deg_s": rotation_rate,
-                            "is_localization_fix": False, "guard_enabled": True}
+                    blocked = True
+                    discontinuity = {"external_pose_discontinuity": True, "speed_m_s": speed,
+                                     "rotation_rate_deg_s": rotation_rate}
+                    unvalidated.update(integration_allowed=False, status="external_pose_discontinuity", **discontinuity)
+        if stamp_ns is not None and (self.previous_external_pose is None or int(stamp_ns) > self.previous_external_pose[0]):
+            self.previous_external_pose = int(stamp_ns), T.copy()
         current = self._features(rgb, depth, K, T)
+        current["stamp_ns"] = None if stamp_ns is None else int(stamp_ns)
         def accepted(value):
+            value["rgbd_recovery_active"] = self.visual_tracking_active
+            value.setdefault("recovery_confirmations", self.recovery_hits)
             if stamp_ns is not None and value["integration_allowed"]:
-                self.previous_pose = int(stamp_ns), T.copy()
+                pose = np.asarray(value["corrected_T_local_camera"]) if value.get("mapping_pose_corrected") else T
+                self.previous_pose = int(stamp_ns), pose.copy()
             return value
+        def unknown():
+            # A weak intervening frame cannot contribute to three consecutive
+            # independent confirmations or release a previously latched guard.
+            self.recovery_hits, self.recovery_candidate = 0, None
+            return accepted(unvalidated)
         if self.anchor is None:
             self.anchor = current
             return accepted(unvalidated)
         reference = self.anchor
         if reference["descriptors"] is None:
-            self.anchor = current
-            return accepted(unvalidated)
-        if current["descriptors"] is None:
-            return accepted(unvalidated)
-        if reference["shape"] != current["shape"] or not np.allclose(reference["K"], K):
-            if not self.revalidation_required:
+            if not blocked:
                 self.anchor = current
-            return accepted(unvalidated)
+            return unknown()
+        if current["descriptors"] is None:
+            return unknown()
+        if reference["shape"] != current["shape"] or not np.allclose(reference["K"], K):
+            if not blocked:
+                self.anchor = current
+            return unknown()
         matches = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(reference["descriptors"], current["descriptors"], k=2)
         matches = [pair[0] for pair in matches if len(pair) == 2 and pair[0].distance < .72 * pair[1].distance]
         matches = [m for m in matches if np.isfinite(reference["points"][m.queryIdx]).all()
@@ -201,22 +349,22 @@ class PoseConsistencyGuard:
         if len(matches) < 24:
             # A changed viewpoint can require a new anchor. Do not reset merely
             # because a valid stationary contradiction has been observed.
-            if not self.revalidation_required:
+            if not blocked:
                 self.anchor = current
-            return accepted(unvalidated)
+            return unknown()
         xyz = np.asarray([reference["points"][m.queryIdx] for m in matches], np.float64)
         uv = np.asarray([current["pixels"][m.trainIdx] for m in matches], np.float64)
         try:
             ok, rvec, tvec, inliers = cv2.solvePnPRansac(xyz, uv, K, None, iterationsCount=150,
                     reprojectionError=2.5, confidence=.995, flags=cv2.SOLVEPNP_EPNP)
         except cv2.error:
-            return accepted(unvalidated)
+            return unknown()
         if not ok or inliers is None or len(inliers) < 24 or len(inliers) / len(matches) < .55:
-            return accepted(unvalidated)
+            return unknown()
         ids = inliers.reshape(-1)
         spread = np.ptp(uv[ids], axis=0) / np.array([depth.shape[1], depth.shape[0]])
         if np.any(spread < .25):
-            return accepted(unvalidated)
+            return unknown()
         visual = np.eye(4)
         visual[:3, :3] = cv2.Rodrigues(rvec)[0]
         visual[:3, 3] = tvec.reshape(3)
@@ -225,12 +373,23 @@ class PoseConsistencyGuard:
         measured = depth[rounded[:, 1], rounded[:, 0]]
         good = np.isfinite(measured) & (measured > .2)
         if np.count_nonzero(good) < 16 or np.median(np.abs(transformed[good, 2] - measured[good])) > .08:
-            return accepted(unvalidated)
+            return unknown()
         result = self.compare(reference["T"], T, visual, self.rotation_deg, self.translation_m)
-        self.revalidation_required = not result["integration_allowed"]
         result["visual_inliers"] = len(ids)
         result["guard_enabled"] = True
-        if result["integration_allowed"] and (np.linalg.norm(visual[:3, 3]) > .4 or _rotation_angle(visual) > 15.):
+        result["rgbd_recovery_enabled"] = self.rgbd_recovery
+        if discontinuity:
+            result.update(discontinuity, integration_allowed=False, status="external_pose_discontinuity")
+        if not result["integration_allowed"] or self.visual_tracking_active:
+            if self.rgbd_recovery:
+                result = self._recover(reference, current, matches, ids, visual, depth, K, T, stamp_ns, result)
+            else:
+                result.update(integration_allowed=False)
+        else:
+            self.recovery_hits, self.recovery_candidate = 0, None
+        self.revalidation_required = not result["integration_allowed"]
+        if (result["integration_allowed"] and not self.visual_tracking_active
+                and (np.linalg.norm(visual[:3, 3]) > .4 or _rotation_angle(visual) > 15.)):
             self.anchor = current
         return accepted(result)
 
@@ -297,6 +456,7 @@ class PerceptionFleet:
                           internal_frame=f"{robot}/local", publish_frame=f"{robot}/local", world_model_source_id=robot)
             self._parameters[robot] = params
         self._nodes, self._sessions, self._last, self._guards = {}, {}, {}, {}
+        self._last_integrated, self._preview_cache, self._active_frames = {}, {}, {}
         self._models = None
         self._images, self._health = {}, {}
         self._snapshot_lock = threading.Lock()
@@ -310,11 +470,21 @@ class PerceptionFleet:
         ok, data = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
         if ok:
             with self._snapshot_lock:
-                self._images[(robot, view)] = (data.tobytes(), int(stamp))
+                frame = self._active_frames.get(robot, {})
+                self._images[(robot, view)] = (data.tobytes(), int(stamp),
+                    frame.get("session_id", self._sessions.get(robot)),
+                    frame.get("received_monotonic", time.monotonic()))
 
-    def get_image(self, robot, view):
+    def get_image(self, robot, view, session_id=None):
         with self._snapshot_lock:
-            return self._images.get((str(robot), VIEW_ALIASES.get(view, view)))
+            image = self._images.get((str(robot), VIEW_ALIASES.get(view, view)))
+            return image[:2] if image is not None and (session_id is None or image[2] == session_id) else None
+
+    def image_metadata(self, robot, session_id=None):
+        """Acquisition monotonic times, independent of transient worker health."""
+        with self._snapshot_lock:
+            return {view: image[3] for (source, view), image in self._images.items()
+                    if source == str(robot) and (session_id is None or image[2] == session_id)}
 
     def health(self):
         with self._snapshot_lock:
@@ -326,13 +496,17 @@ class PerceptionFleet:
             if old is not None:
                 old.destroy_node()
             self._last.pop(robot, None)
+            self._last_integrated.pop(robot, None)
+            self._preview_cache.pop(robot, None)
+            self._active_frames.pop(robot, None)
             guard = self._pose_config
             self._guards[robot] = PoseConsistencyGuard(
                 enabled=guard.get("enabled", True),
                 rotation_deg=guard.get("max_rotation_error_deg", 5.),
                 translation_m=guard.get("max_translation_error_m", .15),
                 max_speed_m_s=guard.get("max_speed_m_s", 2.),
-                max_yaw_rate_deg_s=guard.get("max_yaw_rate_deg_s", 150.))
+                max_yaw_rate_deg_s=guard.get("max_yaw_rate_deg_s", 150.),
+                rgbd_recovery=guard.get("rgbd_recovery", True))
             with self._snapshot_lock:
                 self._images = {key: val for key, val in self._images.items() if key[0] != robot}
             node = self.node_factory(robot, self._parameters[robot], self._models, self.context, self._put_image)
@@ -370,8 +544,10 @@ class PerceptionFleet:
         if robot not in self.robots:
             raise ValueError(f"Unknown rover {robot}")
         seq, stamp = int(observation["seq"]), int(observation["stamp_ns"])
+        preview_only = observation.get("preview_only", False)
         previous = self._last.get(robot) if self._sessions.get(robot) == session else None
-        if previous and (seq <= previous[0] or stamp <= previous[1]):
+        promoting = bool(previous and stamp == previous[1] and previous[2] and not preview_only)
+        if previous and (seq <= previous[0] or stamp < previous[1] or (stamp == previous[1] and not promoting)):
             raise ValueError("Duplicate or out-of-order observation; not independent evidence")
         started = time.perf_counter()
         def stage(name):
@@ -380,6 +556,27 @@ class PerceptionFleet:
                                       "status": "processing", "stage": name}
         stage("loading_models" if robot not in self._nodes else "pose_validation")
         node = self._get_node(robot, session)
+        received = float(observation.get("received_monotonic", time.monotonic()))
+        if not math.isfinite(received):
+            received = time.monotonic()
+        rgb_stamp = int(observation.get("rgb_stamp_ns", stamp))
+        signature = (session, stamp, rgb_stamp, observation["calibration_id"])
+        cached = self._preview_cache.get(robot) if promoting else None
+        reused = bool(cached is not None and cached["signature"] == signature
+                      and np.array_equal(cached["rgb"], bgr)
+                      and np.array_equal(cached["depth"], depth, equal_nan=True)
+                      and np.array_equal(cached["K"], K))
+        if reused:
+            received = cached["received_monotonic"]
+        with self._snapshot_lock:
+            self._active_frames[robot] = dict(session_id=session, received_monotonic=received)
+        # Camera-space previews never depend on pose validity or map fusion.
+        self._put_image(robot, "rgb", bgr, rgb_stamp)
+        valid = np.isfinite(depth) & (depth > 0.)
+        depth_u8 = np.clip(255. * (1. - np.where(valid, depth, 8.) / 8.), 0, 255).astype(np.uint8)
+        depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
+        depth_color[~valid] = 0
+        self._put_image(robot, "depth", depth_color, stamp)
         value = lambda key: node.get_parameter(key).value
         if node.model is None:
             raise RuntimeError("Shared CLIP model is unavailable; semantic integration is disabled")
@@ -388,52 +585,75 @@ class PerceptionFleet:
         if bool(value("use_dinov2_features")) and node.dinov2_model is None:
             raise RuntimeError("DINO model failed to load; verify its local repository/checkpoint or download configuration")
         stage("pose_validation")
-        pose = self._guards[robot].check(bgr, depth, K, T, stamp)
-        result = {**observation, "integration_allowed": pose["integration_allowed"], "pose_quality": pose}
-        if not pose["integration_allowed"]:
-            result.update(surfaces=[], global_descriptor=np.zeros(0, np.float32))
-            with self._snapshot_lock:
-                self._health[robot] = {"seq": seq, "stamp_ns": stamp, "status": "pose_rejected", "pose_quality": pose}
-            self._last[robot] = (seq, stamp)
-            return result
+        if preview_only:
+            provided = observation.get("pose_quality")
+            pose = dict(provided) if isinstance(provided, dict) else {"status": provided or "timestamped_tf_unavailable"}
+            pose.update(integration_allowed=False, is_localization_fix=False, guard_evaluated=False)
+        else:
+            pose = self._guards[robot].check(bgr, depth, K, T, stamp)
+            pose["guard_evaluated"] = True
+        if pose["integration_allowed"] and pose.get("mapping_pose_corrected"):
+            # This is a validated camera-to-local transform, never a change to
+            # robot TF. Preserve the raw source matrix in pose_quality; backend
+            # keyframes and local surface fusion must use the exact same pose.
+            T = np.asarray(pose["corrected_T_local_camera"], dtype=np.float64)
+        result = {**observation, "T_local_camera": T,
+                  "integration_allowed": pose["integration_allowed"], "pose_quality": pose}
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         points, uu, vv = depth_points(depth, K, max(1, int(value("stride"))),
                                      float(value("min_depth_m")), float(value("max_depth_m")))
-        if not len(points):
+        if not len(points) and pose["integration_allowed"]:
             raise ValueError("No valid depth support; no semantic map update performed")
         node.fx, node.fy, node.cx, node.cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-        point_local = (points @ T[:3, :3].T + T[:3, 3]).astype(np.float32)
         header = self._header(stamp, f"{robot}/camera_optical")
-        rgb_header = self._header(observation.get("rgb_stamp_ns", stamp), f"{robot}/camera_optical")
-        phases = {}
-        stage("eSAM")
-        mark = time.perf_counter()
-        masks, scores = node.segment_esam_masks(rgb)
-        phases["sam_ms"] = (time.perf_counter() - mark) * 1000
-        stage("DINO")
-        mark = time.perf_counter()
-        dense = node.compute_dinov2_dense_features(rgb)
-        phases["dino_ms"] = (time.perf_counter() - mark) * 1000
-        stage("CLIP_and_pooling")
-        mark = time.perf_counter()
-        if masks:
-            dino, quality = node.compute_dinov2_mask_embeddings(masks, dense, return_quality=True)
-            clip = node.compute_mask_embeddings_batched(rgb, masks, dense_clip=None)
+        rgb_header = self._header(rgb_stamp, f"{robot}/camera_optical")
+        phases = dict(sam_ms=0., dino_ms=0., pool_clip_ms=0., fusion_ms=0.)
+        if reused:
+            masks, scores, dense, dino, quality, clip = cached["features"]
         else:
-            dino, quality, clip = np.zeros((0, 0), np.float32), np.zeros(0, np.float32), np.zeros((0, 0), np.float32)
-        phases["pool_clip_ms"] = (time.perf_counter() - mark) * 1000
-        semantic = dict(seq=seq, obs_time_s=node.now_sec(), rgb_cv=rgb, rgb_header=rgb_header, depth_header=header,
-                        pts_int=point_local, cam_int=T[:3, 3].astype(np.float32), uu=uu, vv=vv,
-                        z_cam=points[:, 2], image_shape=depth.shape, masks=masks, mask_scores=scores,
-                        mask_emb=clip, dino_mask_emb=dino, dino_mask_quality=quality,
-                        dense_clip=None, dense_dino=dense)
-        mark = time.perf_counter()
-        stage("local_fusion_and_identity")
-        if not node.apply_semantic_result(semantic, "collaborative"):
-            raise ValueError("Local perception rejected this observation")
-        phases["fusion_ms"] = (time.perf_counter() - mark) * 1000
-        self._last[robot] = (seq, stamp)
-        surfaces = self._surface_evidence(node, points, dino, quality, masks, uu, vv)
+            stage("eSAM")
+            mark = time.perf_counter()
+            masks, scores = node.segment_esam_masks(rgb)
+            phases["sam_ms"] = (time.perf_counter() - mark) * 1000
+            stage("DINO")
+            mark = time.perf_counter()
+            dense = node.compute_dinov2_dense_features(rgb)
+            phases["dino_ms"] = (time.perf_counter() - mark) * 1000
+            stage("CLIP_and_pooling")
+            mark = time.perf_counter()
+            if masks:
+                dino, quality = node.compute_dinov2_mask_embeddings(masks, dense, return_quality=True)
+                clip = node.compute_mask_embeddings_batched(rgb, masks, dense_clip=None)
+            else:
+                dino, quality, clip = np.zeros((0, 0), np.float32), np.zeros(0, np.float32), np.zeros((0, 0), np.float32)
+            phases["pool_clip_ms"] = (time.perf_counter() - mark) * 1000
+        surfaces = []
+        if pose["integration_allowed"]:
+            point_local = (points @ T[:3, :3].T + T[:3, 3]).astype(np.float32)
+            semantic = dict(seq=seq, obs_time_s=node.now_sec(), rgb_cv=rgb, rgb_header=rgb_header, depth_header=header,
+                            pts_int=point_local, cam_int=T[:3, 3].astype(np.float32), uu=uu, vv=vv,
+                            z_cam=points[:, 2], image_shape=depth.shape, masks=masks, mask_scores=scores,
+                            mask_emb=clip, dino_mask_emb=dino, dino_mask_quality=quality,
+                            dense_clip=None, dense_dino=dense)
+            mark = time.perf_counter()
+            stage("local_fusion_and_identity")
+            if not node.apply_semantic_result(semantic, "collaborative"):
+                raise ValueError("Local perception rejected this observation")
+            phases["fusion_ms"] = (time.perf_counter() - mark) * 1000
+            self._last_integrated[robot] = stamp
+            surfaces = self._surface_evidence(node, points, dino, quality, masks, uu, vv)
+        else:
+            # These methods render camera-space diagnostics only. In particular
+            # never call apply_semantic_result with an invented/frozen pose.
+            stage("camera_diagnostics_fusion_paused")
+            node.publish_esam_mask_overlay(rgb, masks, rgb_header)
+            node.publish_feature_diagnostics(rgb, masks, clip, dino, quality, dense, rgb_header)
+        self._last[robot] = (seq, stamp, preview_only)
+        if preview_only:
+            self._preview_cache[robot] = dict(signature=signature, rgb=bgr.copy(), depth=depth.copy(), K=K.copy(),
+                received_monotonic=received, features=(masks, scores, dense, dino, quality, clip))
+        else:
+            self._preview_cache.pop(robot, None)
         model_settings = {}
         for key in FEATURE_KEYS:
             try:
@@ -445,18 +665,18 @@ class PerceptionFleet:
                       global_descriptor=pooled_dino_descriptor(dense), feature_space_id=feature_id,
                       local_world_id=node.world_model_id, mask_count=len(masks),
                       segment_count=len(node.seg_w), entity_count=len(node.entity_memory.records),
-                      timings_ms=phases)
-        self._put_image(robot, "rgb", bgr, observation.get("rgb_stamp_ns", stamp))
-        valid = np.isfinite(depth) & (depth > 0.)
-        depth_u8 = np.clip(255. * (1. - np.where(valid, depth, 8.) / 8.), 0, 255).astype(np.uint8)
-        depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
-        depth_color[~valid] = 0
-        self._put_image(robot, "depth", depth_color, stamp)
+                      timings_ms=phases, visual_processed=True, map_integrated=pose["integration_allowed"],
+                      inference_reused=reused, last_visual_stamp_ns=rgb_stamp,
+                      last_integrated_stamp_ns=self._last_integrated.get(robot))
         result["processing_ms"] = (time.perf_counter() - started) * 1000
         with self._snapshot_lock:
-            self._health[robot] = {"seq": seq, "stamp_ns": stamp, "session_id": session, "status": "processed",
+            self._health[robot] = {"seq": seq, "stamp_ns": stamp, "session_id": session,
+                                  "status": "preview_only" if preview_only else "processed" if pose["integration_allowed"] else "pose_rejected",
                                   "processing_ms": result["processing_ms"], "timings_ms": phases,
                                   "segments": result["segment_count"], "entities": result["entity_count"],
+                                  "visual_processed": True, "map_integrated": pose["integration_allowed"],
+                                  "last_visual_stamp_ns": rgb_stamp,
+                                  "last_integrated_stamp_ns": self._last_integrated.get(robot),
                                   "pose_quality": pose, "device": str(node.device),
                                   "sam_available": node.esam_model is not None, "dino_available": node.dinov2_model is not None}
         return result

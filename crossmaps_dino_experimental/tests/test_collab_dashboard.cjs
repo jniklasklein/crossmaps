@@ -1,6 +1,6 @@
 "use strict";
 const assert = require("node:assert/strict");
-const { robotId, escapeText, ageLabel, matrix, transformPoint, inverseRigid, matrixProduct, anchorTransform, normalizeSnapshot, buildCloud, candidateConstraint, activeEntityLink, modePresentation, imageAge, orderedCandidates, healthState } = require("../collab_dashboard/app.js");
+const { robotId, escapeText, ageLabel, matrix, transformPoint, inverseRigid, matrixProduct, anchorTransform, normalizeSnapshot, buildCloud, candidateConstraint, activeEntityLink, modePresentation, imageAge, orderedCandidates, healthState, healthPresentation, currentComponent, mappingPaused, displayedImageAge, imageCaption, shadowDescription, alignmentEvidence, candidateReason } = require("../collab_dashboard/app.js");
 let checks = 0;
 function check(name, fn) { fn(); checks++; console.log(`ok ${checks} - ${name}`); }
 const I = anchorTransform(0, 0, 0, 0);
@@ -27,8 +27,8 @@ check("candidate actions target concrete verified constraint IDs", () => { const
 check("camera health derives from actual source age", () => { assert.equal(healthState({ frame_age_s: 20 }), "stale"); assert.equal(healthState({ frame_age_s: .1 }), "healthy"); assert.equal(healthState({ status: "waiting" }), "waiting"); assert.equal(healthState({ frame_age_s: 0, error: "lost" }), "error"); });
 check("historical acceptance is not current shared identity evidence", () => { assert.equal(activeEntityLink({ active: true, alignment_valid: true, compatible_current: true }), true); assert.equal(activeEntityLink({ active: true, alignment_valid: true, compatible_current: false }), false); assert.equal(activeEntityLink({ active: true, alignment_valid: false, compatible_current: true }), false); assert.equal(activeEntityLink({ active: false, alignment_valid: true, compatible_current: true }), false); });
 check("demo and replay cannot be mistaken for live observations", () => { assert.match(modePresentation({ mode: "synthetic_demo" }).label, /Synthetic demo/); assert.match(modePresentation({ mode: "recorded_replay" }).label, /Recorded replay/); assert.match(modePresentation({ mode: "live", shadow_mode: true }).label, /shadow/); });
-check("view age follows that image rather than last processed observation", () => { const robot = { frame_age_s: 1, observation_age_s: 2, image_age_s: { sam: 30 } }; assert.equal(imageAge(robot, "sam"), 30); assert.equal(imageAge(robot, "rgb"), 1); assert.equal(imageAge(robot, "entities"), 2); });
-check("input and perception failures stay visible despite fresh RGB", () => { assert.equal(healthState({ frame_age_s: .1, last_error: "TF unavailable" }), "error"); assert.equal(healthState({ frame_age_s: .1, status: "pose_rejected" }), "pose_rejected"); assert.equal(healthState({ frame_age_s: .1, perception: { error: "model failed" } }), "error"); });
+check("view age belongs only to that produced image", () => { const robot = { frame_age_s: 1, observation_age_s: 2, image_age_s: { rgb: 1, sam: 30 } }; assert.equal(imageAge(robot, "sam"), 30); assert.equal(imageAge(robot, "rgb"), 1); assert.equal(imageAge(robot, "entities"), null); assert.equal(imageAge({ image_age_s: { sam: null }, observation_age_s: 0 }, "sam"), null); });
+check("input and perception failures are distinguished despite fresh RGB", () => { assert.equal(healthState({ frame_age_s: .1, health: { status: "waiting_for_tf", last_error: "TF unavailable" } }), "waiting_for_tf"); assert.equal(healthState({ frame_age_s: .1, status: "pose_rejected" }), "mapping_paused"); assert.equal(healthState({ frame_age_s: .1, perception: { status: "error", error: "model failed" } }), "error"); });
 check("actionable verification is sorted before unverified proposals", () => { const snapshot = normalizeSnapshot({ candidates: [{ id: "v", state: "verified" }, { id: "p", state: "proposed" }, { id: "r", state: "rejected" }], constraints: [] }); assert.deepEqual(orderedCandidates(snapshot).map((candidate) => candidate.id), ["v", "p", "r"]); });
 check("polling ages does not invalidate evidence controls", () => {
   const { evidenceRenderKey } = require("../collab_dashboard/app.js");
@@ -36,5 +36,71 @@ check("polling ages does not invalidate evidence controls", () => {
   const next = { ...first, revision: 2, robots: [{ robot_id: "A", frame_age_s: 2 }] };
   assert.equal(evidenceRenderKey(first), evidenceRenderKey(next));
   assert.notEqual(evidenceRenderKey(first), evidenceRenderKey({ ...next, candidates: [{ id: "v", state: "accepted" }] }));
+});
+check("recovered component status suppresses historical error strings", () => {
+  const robot = { status: "healthy", frame_age_s: .1, last_error: "old worker failure", health: { status: "receiving", last_error: "old TF failure" }, perception: { status: "processed", error: "old model failure" } };
+  assert.equal(healthState(robot), "healthy"); assert.equal(healthPresentation(robot).detail, "");
+});
+check("stalled compressed RGB is not masked by the last frame's TF error", () => {
+  const badge = healthPresentation({ frame_age_s: 280, health: { status: "rgb_stale", rgb_reader_attempts: 2 },
+    pose_quality: { status: "timestamped_tf_unavailable" } });
+  assert.equal(badge.label, "Camera stale"); assert.match(badge.detail, /retries: 2/);
+});
+check("session replacement cannot inherit old perception failure or pose pause", () => {
+  const robot = { session_id: "new", status: "healthy", frame_age_s: .1, perception: { session_id: "old", status: "error", error: "failed", pose_quality: { integration_allowed: false } } };
+  assert.deepEqual(currentComponent(robot, "perception"), {}); assert.equal(healthState(robot), "healthy"); assert.equal(mappingPaused(robot), false);
+});
+check("TF wait and rejected input are warnings rather than process crashes", () => {
+  assert.equal(healthPresentation({ frame_age_s: .1, health: { status: "waiting_for_tf", last_error: "pose missing" } }).style, "pending");
+  assert.equal(healthState({ frame_age_s: .1, health: { status: "input_rejected", last_error: "calibration wrong" } }), "input_rejected");
+  assert.equal(healthState({ frame_age_s: .1, status: "processing_error", last_error: "model crashed" }), "error");
+});
+check("mapping pause does not claim fresh model outputs are stale map outputs", () => {
+  const robot = { status: "pose_rejected", map_observation_age_s: 50, observation_age_s: .2, image_age_s: { sam: .2, segments: 50 } };
+  assert.match(imageCaption(robot, "segments", { available: true, age: imageAge(robot, "segments") }), /Last mapped overlay.*50.0 s old.*mapping paused/);
+  assert.match(imageCaption(robot, "sam", { available: true, age: imageAge(robot, "sam") }), /Perception image.*200 ms old/);
+  assert.doesNotMatch(imageCaption(robot, "sam", { available: true, age: .2 }), /mapped overlay/);
+});
+check("missing views never borrow recent perception freshness", () => {
+  assert.equal(imageAge({ observation_age_s: 0, image_age_s: {} }, "entities"), null);
+  assert.equal(imageCaption({}, "entities", { available: false, age: 0 }), "No image for this view/session");
+  assert.match(imageCaption({}, "entities", { available: true, age: null }), /age unknown/);
+});
+check("pausing preview ages the displayed frame even if backend is updating", () => {
+  const camera = { displayedAge: 2, displayedAt: 1000 };
+  assert.equal(displayedImageAge(camera, 6000), 7);
+  assert.match(imageCaption({}, "rgb", { preview: false, available: true, age: displayedImageAge(camera, 6000) }), /Preview paused.*7.0 s old/);
+  assert.equal(displayedImageAge({ displayedAge: null, displayedAt: 1000 }, 6000), null);
+});
+check("shadow description distinguishes perception from automatic world-model decisions", () => {
+  assert.match(shadowDescription(true), /local perception and mapping running/);
+  assert.match(shadowDescription(true), /manually accepted links remain active/);
+  assert.match(shadowDescription(false), /entity proposals can be accepted immediately/);
+});
+check("alignment funnel uses complete retained counts instead of capped display list", () => {
+  const summary = alignmentEvidence(normalizeSnapshot({ shadow_mode: false, alignment_evidence: { retrieved: 209, checked: 90, verified: 0, active: 0, best_rejection: { reason: "insufficient_geometric_inliers", inliers: 11 } }, candidates: [{ state: "proposed", score: .96 }] }));
+  assert.equal(summary.retrieved, 209); assert.equal(summary.unchecked, 119);
+  assert.equal(summary.title, "First verified pair still needed"); assert.match(summary.rejection, /11 inliers/);
+  assert.match(summary.next, /not alignment confidence/); assert.doesNotMatch(summary.next, /second compatible/);
+});
+check("verified-but-unaccepted alignment calls for one rover's distinct view", () => {
+  const summary = alignmentEvidence({ shadow_mode: false, alignment_evidence: { retrieved: 10, checked: 8, verified: 1, active: 0 } });
+  assert.equal(summary.title, "Distinct-view corroboration still needed"); assert.match(summary.next, /Moving one rover is sufficient/); assert.match(summary.next, /Stationary repeats/);
+});
+check("shadow decision and supplied anchor are not mistaken for failed verification", () => {
+  const shadow = alignmentEvidence({ shadow_mode: true, alignment_evidence: { retrieved: 1, checked: 1, verified: 1, active: 0 } });
+  assert.match(shadow.title, /awaiting a decision/); assert.match(shadow.next, /Shadow mode prevents/);
+  const anchored = alignmentEvidence({ constraints: [{ kind: "anchor", active: true }], candidates: [] });
+  assert.equal(anchored.title, "Supplied alignment active"); assert.match(anchored.next, /Object identity still needs/);
+});
+check("skipped verification is labeled as a budget decision, not a failed match", () => {
+  assert.match(candidateReason({ reason: "retrieved_not_verified" }), /per-keyframe verification budget/);
+  assert.match(candidateReason({ reason: "retrieved_not_verified" }), /not a failed match/);
+  assert.equal(candidateReason({ verification: { reason: "rgbd_verified" } }), "rgbd_verified");
+});
+check("alignment summary changes invalidate evidence rendering", () => {
+  const { evidenceRenderKey } = require("../collab_dashboard/app.js");
+  const state = normalizeSnapshot({ alignment_evidence: { retrieved: 100, checked: 20 } });
+  assert.notEqual(evidenceRenderKey(state), evidenceRenderKey({ ...state, alignment_evidence: { retrieved: 101, checked: 20 } }));
 });
 console.log(`${checks} collaborative dashboard checks passed`);

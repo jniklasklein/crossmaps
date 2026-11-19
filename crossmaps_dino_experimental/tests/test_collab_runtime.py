@@ -73,9 +73,10 @@ class ConfigurationTests(unittest.TestCase):
             validate_config({"input": {"min_depth_m": 2., "max_depth_m": 1.}})
 
     def test_pose_guard_bounds_and_boolean_enabled(self):
-        for value in (0, 1, "false", None):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                validate_config({"pose_guard": {"enabled": value}})
+        for key in ("enabled", "rgbd_recovery"):
+            for value in (0, 1, "false", None):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    validate_config({"pose_guard": {key: value}})
         for name, lower, upper in (("max_translation_error_m", .01, 10.),
                                    ("max_rotation_error_deg", .1, 90.),
                                    ("max_speed_m_s", .01, 20.),
@@ -129,6 +130,15 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(state["pending"])
         self.assertEqual(len(self.scheduler.pending), 1)
         self.assertEqual(self.scheduler.take()["seq"], 100)
+
+    def test_mapping_packet_has_priority_until_expired(self):
+        self.scheduler.offer(self.packet(seq=1))
+        self.assertFalse(self.scheduler.offer(dict(self.packet(seq=2), preview_only=True)))
+        self.assertEqual(self.scheduler.take()['seq'], 1)
+        self.scheduler.offer(self.packet(seq=3))
+        self.now += 3.
+        self.assertTrue(self.scheduler.offer(dict(self.packet(seq=4), preview_only=True)))
+        self.assertTrue(self.scheduler.take()['preview_only'])
 
     def test_duplicate_and_out_of_order_sequences_are_not_new_evidence(self):
         self.scheduler.offer(self.packet(seq=7))

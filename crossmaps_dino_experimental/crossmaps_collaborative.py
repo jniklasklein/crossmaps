@@ -27,7 +27,7 @@ from collab_backend import Backend
 from collab_config import ROOT, load_config, owned_run_directory
 from collab_dashboard import CollaborativeDashboard
 from collab_runtime import FairLatestScheduler, CycleTiming
-from collab_transport import run_adapter
+from collab_transport import require_compressed_transport, run_adapter
 from pipeline_instance import PipelineInstance
 
 
@@ -95,15 +95,20 @@ class FleetApplication:
             raise ValueError('Recorded replay does not accept live input')
         if not self.scheduler.offer(observation):
             return False
-        now = time.monotonic()
-        # Preview is acquisition-driven, never blocked by semantic inference.
-        bgr = observation['rgb']
-        ok, jpeg = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        received = observation['received_monotonic']
         with self.state_lock:
-            if ok:
-                self.images[(robot, 'rgb')] = (jpeg.tobytes(), now)
             state = self.telemetry[robot]
-            state.update(last_frame_monotonic=now, session_id=observation['session_id'],
+            if state.get('session_id') != observation['session_id']:
+                for key in ('last_mapped_monotonic', 'last_processed_monotonic', 'last_processed_stamp_ns',
+                            'pose_quality', 'counts', 'last_error'):
+                    state.pop(key, None)
+            # Live adapters supply camera previews asynchronously. Demo and direct
+            # callers without an adapter use the offered frame as their preview.
+            if robot not in self.adapters:
+                ok, jpeg = cv2.imencode('.jpg', observation['rgb'], [cv2.IMWRITE_JPEG_QUALITY, 82])
+                if ok:
+                    self.images[(robot, 'rgb')] = (jpeg.tobytes(), received)
+            state.update(last_frame_monotonic=received, session_id=observation['session_id'],
                          last_input_stamp_ns=observation['stamp_ns'],
                          status='processing' if self.active_robot == robot else 'receiving',
                          depth_registration=observation.get('depth_registration'),
@@ -129,18 +134,26 @@ class FleetApplication:
                     self.fleet = PerceptionFleet(self.config, context=self.context)
                 enriched = self.fleet.process(observation)
                 inference_elapsed = time.monotonic()-started
-            with self.backend_lock:
-                snapshot = self.backend.ingest(enriched)
-                with self.state_lock:
-                    self.cached = snapshot
+            preview_only = observation.get('preview_only', False)
+            if not preview_only:
+                with self.backend_lock:
+                    snapshot = self.backend.ingest(enriched)
+                    with self.state_lock:
+                        self.cached = snapshot
             finished = time.monotonic()
             with self.state_lock:
                 self.timing[robot].add(finished-started, inference_elapsed,
                                       finished-observation['received_monotonic'])
                 self.total_timing.add(finished-started, inference_elapsed,
                                       finished-observation['received_monotonic'])
-                allowed = enriched.get('integration_allowed', True)
-                self.telemetry[robot].update(status='healthy' if allowed else 'pose_rejected',
+                state = self.telemetry[robot]
+                if state.get('session_id') != observation['session_id']:
+                    return True
+                allowed = not preview_only and enriched.get('integration_allowed', True)
+                if allowed:
+                    state['last_mapped_monotonic'] = observation['received_monotonic']
+                status = 'waiting_for_tf' if preview_only else 'healthy' if allowed else 'pose_rejected'
+                state.update(status=status,
                     last_processed_monotonic=finished,
                     last_processed_stamp_ns=observation['stamp_ns'], pose_quality=enriched.get('pose_quality'),
                     counts=dict(masks=enriched.get('mask_count'), segments=enriched.get('segment_count'),
@@ -205,13 +218,12 @@ class FleetApplication:
             for _ in range(4):
                 try:
                     health = adapter['health'].get_nowait()
-                    preview = health.pop('preview_jpeg', None)
                     with self.state_lock:
+                        for view, prefix in (('rgb', 'preview'), ('depth', 'depth_preview')):
+                            jpeg = health.pop(prefix+'_jpeg', None)
+                            if jpeg:
+                                self.images[(robot, view)] = (jpeg, health[prefix+'_monotonic'])
                         self.telemetry[robot]['health'] = health
-                        if preview:
-                            self.images[(robot, 'rgb')] = (preview, float(health.get('preview_monotonic', time.monotonic())))
-                        if health.get('last_error'):
-                            self.telemetry[robot].update(status='input_rejected', last_error=health['last_error'])
                 except queue.Empty:
                     break
             try:
@@ -248,6 +260,8 @@ class FleetApplication:
                 advanced = data.get('health', {}).get('rgb_advanced_monotonic', data.get('last_frame_monotonic'))
                 data['frame_age_s'] = None if advanced is None else round(now-advanced, 2)
                 data['observation_age_s'] = None if 'last_processed_monotonic' not in data else round(now-data['last_processed_monotonic'], 2)
+                mapped = data.get('last_mapped_monotonic')
+                data['map_observation_age_s'] = None if mapped is None else round(now-mapped, 2)
                 data['timing'] = self.timing[robot].snapshot()
                 data['timing_ms'] = data['timing']
                 data['image_age_s'] = {view: round(now-stamp, 2) for (source, view), (_, stamp) in self.images.items() if source == robot}
@@ -269,26 +283,22 @@ class FleetApplication:
         for data in snapshot['robots']:
             robot = data['robot_id']
             data['scheduler'] = scheduler[robot]
-            data['perception'] = fleet_health.get(robot, {})
-            if self.fleet and fleet_health.get(robot, {}).get('session_id') == data.get('session_id'):
-                for view in ('sam', 'segments', 'entities', 'dino', 'dino_similarity', 'clip', 'depth'):
-                    image = self.fleet.get_image(robot, view)
-                    if image:
-                        data['image_age_s'][view] = max(0., time.time()-image[1]/1e9)
+            health = fleet_health.get(robot, {})
+            session = data.get('session_id')
+            data['perception'] = health if health.get('session_id') == session else {}
+            if self.fleet and session:
+                for view, received in self.fleet.image_metadata(robot, session).items():
+                    data['image_age_s'].setdefault(view, round(max(0., now-received), 2))
         return snapshot
 
     def image(self, robot, view):
         if robot not in self.telemetry:
             return None
-        if view != 'rgb' and self.fleet is not None:
-            health = self.fleet.health().get(robot, {})
-            with self.state_lock:
-                current_session = self.telemetry[robot].get('session_id')
-            result = self.fleet.get_image(robot, view) if health.get('session_id') == current_session else None
-            if result:
-                return result[0], 'image/jpeg'
         with self.state_lock:
             result = self.images.get((robot, view))
+            session = self.telemetry[robot].get('session_id')
+            if result is None and self.fleet and session:
+                result = self.fleet.get_image(robot, view, session_id=session)
         return None if result is None else (result[0], 'image/jpeg')
 
     def command(self, command):
@@ -335,6 +345,9 @@ class FleetApplication:
 def check_environment(config, demo=False):
     from collab_backend import validate_config as validate_backend_config
     validate_backend_config(config.get('backend', {}))
+    if not demo:
+        for robot in config['robots']:
+            require_compressed_transport(robot)
     modules = ['numpy', 'cv2'] if demo else ['numpy', 'cv2', 'rclpy', 'tf2_ros', 'message_filters', 'torch', 'open_clip', 'efficient_sam']
     missing = [name for name in modules if importlib.util.find_spec(name) is None]
     if missing:

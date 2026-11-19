@@ -4,12 +4,14 @@ import math
 import queue
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
 
-from collab_transport import (PendingPair, SensorSequencer, calibration_id, camera_matrix, decode_depth,
-                              decode_rgb, latest_put, register_depth, stamp_ns, tf_matrix)
+from collab_transport import (PendingPair, SensorSequencer, cached_rgbd, calibration_id, camera_matrix, decode_depth,
+                              decode_rgb, depth_preview_jpeg, latest_put, pair_timing, prepare_registered_rgbd,
+                              preview_put, register_depth, require_compressed_transport, stamp_ns, tf_matrix)
 
 
 class ImageDecodeTests(unittest.TestCase):
@@ -223,6 +225,88 @@ class SensorSequencerTests(unittest.TestCase):
             self.assertEqual(result['reason'], reason)
         self.assertTrue(self.sequence.inspect(101_000_000_000)['accept'])
         self.assertEqual(self.sequence.last_stamp, 100_000_000_000)
+
+
+class DiagnosticTransportTests(unittest.TestCase):
+    def test_waiting_for_tf_does_not_turn_arrival_latency_into_clock_error(self):
+        first = pair_timing(100_000_000_000, 100_100_000_000, 50., 50.2, 2.)
+        expired = pair_timing(100_000_000_000, 100_100_000_000, 50., 51.95, 2.)
+        self.assertEqual(first['timing_status'], 'within_latency_budget')
+        self.assertEqual(expired['timing_status'], 'timestamped_tf_wait_expired')
+        self.assertAlmostEqual(expired['selected_frame_age_at_receipt_s'], .1)
+        self.assertAlmostEqual(expired['pending_wait_s'], 1.95)
+        self.assertAlmostEqual(expired['selected_frame_age_s'], 2.05)
+
+    def test_stale_arrival_and_future_sensor_stamp_are_distinct(self):
+        stale = pair_timing(90_000_000_000, 100_000_000_000, 50., 50., 2.)
+        future = pair_timing(105_000_000_000, 100_000_000_000, 50., 50., 2.)
+        self.assertEqual(stale['timing_status'], 'frame_stale_on_arrival')
+        self.assertEqual(future['timing_status'], 'sensor_timestamp_ahead_of_receiver')
+
+    def test_preview_never_evicts_mapping_but_mapping_replaces_preview(self):
+        channel = queue.Queue(maxsize=1)
+        self.assertTrue(latest_put(channel, dict(preview_only=False, seq=1)))
+        self.assertFalse(preview_put(channel, dict(preview_only=True, seq=2)))
+        self.assertEqual(channel.get_nowait()['seq'], 1)
+        self.assertTrue(preview_put(channel, dict(preview_only=True, seq=2)))
+        self.assertTrue(latest_put(channel, dict(preview_only=False, seq=3)))
+        self.assertEqual(channel.get_nowait()['seq'], 3)
+
+    def test_real_adapters_require_compressed_inputs(self):
+        require_compressed_transport(dict(rgb_compressed=True, depth_compressed=True))
+        for field in ('rgb_compressed', 'depth_compressed'):
+            with self.assertRaisesRegex(ValueError, 'compressed'):
+                require_compressed_transport({field: False})
+
+    def test_repeated_tf_retries_reuse_one_calibrated_payload(self):
+        metadata = {}
+        payload = dict(rgb=np.zeros((2, 2, 3), np.uint8), depth=np.ones((2, 2), np.float32))
+        prepare = Mock(return_value=payload)
+        for _ in range(20):
+            self.assertIs(cached_rgbd(metadata, prepare), payload)
+        prepare.assert_called_once()
+
+    def test_depth_acquisition_preview_needs_neither_rgb_nor_pose(self):
+        first = depth_preview_jpeg(np.full((16, 24), 1., np.float32))
+        second = depth_preview_jpeg(np.full((16, 24), 4., np.float32))
+        self.assertNotEqual(first, second)
+        decoded = cv2.imdecode(np.frombuffer(first, np.uint8), cv2.IMREAD_COLOR)
+        self.assertEqual(decoded.shape, (16, 24, 3))
+
+    def test_calibrated_model_preview_rejects_missing_registration_tf_before_decode(self):
+        rgb = SimpleNamespace(header=SimpleNamespace(frame_id='rgb'), data=b'not decoded')
+        depth = SimpleNamespace(header=SimpleNamespace(frame_id='depth'), data=b'not decoded', format='16UC1')
+        info = SimpleNamespace(header=SimpleNamespace(frame_id='rgb'))
+        depth_info = SimpleNamespace(header=SimpleNamespace(frame_id='depth'))
+        robot = dict(depth_registration='auto', rgb_compressed=True, depth_compressed=True)
+        lookup = Mock(side_effect=RuntimeError('no calibration transform'))
+        with patch('collab_transport.decode_rgb') as decode:
+            with self.assertRaisesRegex(RuntimeError, 'calibration transform'):
+                prepare_registered_rgbd(rgb, depth, robot, {}, dict(rgb=info, depth=depth_info), lookup)
+            decode.assert_not_called()
+
+    def test_same_frame_calibrated_preview_contains_no_invented_pose(self):
+        _, rgb_data = cv2.imencode('.jpg', np.full((12, 16, 3), 100, np.uint8))
+        _, depth_data = cv2.imencode('.png', np.full((12, 16), 1500, np.uint16))
+        header = SimpleNamespace(frame_id='camera')
+        rgb = SimpleNamespace(header=header, data=rgb_data.tobytes())
+        depth = SimpleNamespace(header=header, data=depth_data.tobytes(), format='16UC1')
+        info = SimpleNamespace(header=header, width=16, height=12,
+            k=[20., 0., 8., 0., 20., 6., 0., 0., 1.], p=[0.]*12)
+        robot = dict(depth_registration='auto', local_frame='odom', depth_scale=.001)
+        settings = dict(max_pixels=1000, min_depth_m=.2, max_depth_m=8.)
+        lookup = Mock(side_effect=AssertionError('same optical frame needs no extrinsic lookup'))
+        payload = prepare_registered_rgbd(rgb, depth, robot, settings, dict(rgb=info), lookup)
+        self.assertNotIn('T_local_camera', payload)
+        self.assertEqual(payload['depth_registration'], 'same_optical_frame')
+        np.testing.assert_allclose(payload['depth'], 1.5)
+
+
+class SensorEpochConfirmationTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.
+        self.sequence = SensorSequencer(clock=lambda: self.now)
+        self.sequence.commit(100_000_000_000)
 
     def test_one_large_old_pair_rechecked_for_tf_is_not_epoch_evidence(self):
         for _ in range(8):

@@ -193,12 +193,61 @@ def bidirectional_pnp_seed(source, target, pixels_source, pixels_target, min_inl
     return dict(diag, ok=True, reason="bidirectional_pnp_seed", T_target_source=T)
 
 
-def prepare_reprojection(source, target, pixels_a, pixels_b, seed_T, min_inliers=12, seed_indices=None):
-    """Select plausible pixels once; never reselect a holdout to favour a pose.
+def _balanced_holdout(a, b, shapes, valid):
+    """Reserve ~1/4 of usable correspondences before fitting any pose.
 
-    seed_indices, when provided, are positions in the input arrays used by
-    the rigid initializer. Points outside this set are preferred for holdout.
-    All features come from this same image pair, not new corroborating views.
+    Both image grids get proportional coverage. Neither source designation,
+    detector enumeration nor reprojection residuals select the witnesses.
+    """
+    eligible = np.flatnonzero(valid)
+    hold = np.zeros(len(a), bool)
+    if not len(eligible):
+        return hold
+    uv = [p[eligible] / [w, h] for p, (h, w) in zip((a, b), shapes)]
+    cells = []
+    for p in uv:
+        xy = np.clip(np.floor(p * [6, 4]).astype(int), [0, 0], [5, 3])
+        cells.append(xy[:, 0] + 6*xy[:, 1])
+    # Tie-break in a stable, direction-free order before drawing fixed random
+    # priorities: rows swapping or cameras swapping must reserve the same pairs.
+    x, y = uv
+    flip = (x[:, 0] > y[:, 0]) | ((x[:, 0] == y[:, 0]) & (x[:, 1] > y[:, 1]))
+    first, second = np.where(flip[:, None], y, x), np.where(flip[:, None], x, y)
+    order = np.lexsort((second[:, 1], second[:, 0], first[:, 1], first[:, 0]))
+    tie = np.empty(len(order))
+    tie[order] = np.random.default_rng(173).random(len(order))
+    totals = [np.bincount(c, minlength=24).clip(1) for c in cells]
+    counts = [np.zeros(24, int), np.zeros(24, int)]
+    selected = np.zeros(len(eligible), bool)
+    for _ in range(round(0.24*len(eligible))):
+        pa, pb = [(count[c] + .5) / total[c] for c, count, total in zip(cells, counts, totals)]
+        cost = np.maximum(pa, pb) + .25 * (pa+pb) + 1e-8*tie
+        cost[selected] = np.inf
+        i = int(np.argmin(cost))
+        selected[i] = True
+        for c, count in zip(cells, counts):
+            count[c[i]] += 1
+    hold[eligible[selected]] = True
+    return hold
+
+
+def reprojection_partition(source, target, a, b):
+    """Indices of distinct original matches; reserve the same pixels for both directions."""
+    from collab_geometry import _backproject_pixels
+    ix = _unique_matches(a, b)
+    shapes = [v['depth'].shape for v in (source, target)]
+    good = [_backproject_pixels(p[ix], f['depth'], f['K'])[1]
+            for p, f in zip((a, b), (source, target))]
+    hold = _balanced_holdout(a[ix], b[ix], shapes, good[0] | good[1])
+    return ix[~hold], ix[hold]
+
+
+def prepare_reprojection(source, target, pixels_a, pixels_b, seed_T, min_inliers=12, seed_indices=None,
+                         hold_indices=None):
+    """Refinement and audit share a precommitted, bidirectional partition.
+
+    Held-out correspondences contribute to neither initialization nor pixel
+    refinement in verify_rgbd. They are not independent camera viewpoints.
     """
     from collab_geometry import _backproject_pixels
 
@@ -219,21 +268,13 @@ def prepare_reprojection(source, target, pixels_a, pixels_b, seed_T, min_inliers
     metric = np.linalg.norm(A @ T[:3, :3].T + T[:3, 3] - B, axis=1)
     possible &= ~both | (metric < 0.19)
     shapes = [f["depth"].shape for f in (source, target)]
-    h, w = shapes[0]
-    cells = (np.floor(a[:, 0] * 6 / w) + 6 * np.floor(a[:, 1] * 4 / h)).astype(int)
-    # Deterministic, spatially stratified fit/holdout split. The min always
-    # leaves a representative of a multi-point region for refining.
-    hold = np.zeros(len(a), dtype=bool)
+    hold = (_balanced_holdout(a, b, shapes, ga | gb) if hold_indices is None
+            else np.isin(ix, hold_indices))
     seed = (
         np.isin(ix, np.asarray(seed_indices, dtype=int))
         if seed_indices is not None
         else np.ones(len(ix), bool)
     )
-    rng = np.random.default_rng(173)
-    for cell in np.unique(cells[possible]):
-        inds = np.flatnonzero(possible & (cells == cell))
-        order = np.lexsort((rng.random(len(inds)), seed[inds]))
-        hold[inds[order[: min(len(inds) - 1, max(1, round(0.24 * len(inds))))]]] = True
     # Small fixed training grid, deliberately offset from the regular dense
     # verification grid. Use original calibrated depth, never display points.
     surfaces = []
@@ -277,7 +318,13 @@ def audit_reprojection(data, T):
     metric = np.linalg.norm(A @ T[:3, :3].T + T[:3, 3] - B, axis=1)
     ok = (ga | gb) & (~ga | (ea < tb)) & (~gb | (eb < ta)) & (~(ga & gb) | (metric < 0.09))
     n = int(ok.sum())
-    hold = ok & p["hold"]
+    # Match proposals include unrelated descriptors. As in the training branch,
+    # evaluate the support fraction within the *initial seed's* fixed and
+    # deliberately loose pixel/depth capture window. Never reselect it using
+    # the refined transform; do not fit either seed or refinement on ANY
+    # reserved correspondence, including those outside the window.
+    witnesses = p["hold"] & p["possible"]
+    hold = ok & witnesses
     cells = (0, 0)
     hull = inner = 0.0
     if n >= 3:
@@ -292,8 +339,10 @@ def audit_reprojection(data, T):
     # If enough pairs exist for refinement, require measured error also on
     # unseen pixels. These are *held out from refinement*, not new images.
     independent = int((hold & ~p["seed"]).sum())
-    held_n = int(p["hold"].sum())
+    held_n = int(witnesses.sum())
     h_ok = held_n >= 3 and int(hold.sum()) >= max(3, math.ceil(0.22 * held_n))
+    held_direction = [int((hold & valid).sum()) for valid in (ga, gb)]
+    h_ok &= min(held_direction) >= 2
     hold_regions = [
         len(np.unique(np.floor(v[hold] / [s[1] / 4, s[0] / 3]), axis=0))
         for v, s in zip((p["a"], p["b"]), p["shapes"])
@@ -318,6 +367,9 @@ def audit_reprojection(data, T):
         reprojection_inner_area_fraction=inner,
         reprojection_holdout_inliers=int(hold.sum()),
         reprojection_holdout_count=held_n,
+        reprojection_reserved_count=int(p["hold"].sum()),
+        reprojection_holdout_forward_inliers=held_direction[0],
+        reprojection_holdout_reverse_inliers=held_direction[1],
         reprojection_holdout_cells=hold_regions,
         reprojection_holdout_nonseed_inliers=independent,
         reprojection_median_px_forward=float(np.median(ea[ga & ok])) if dirs[0] else None,

@@ -26,8 +26,8 @@ class PendingPair:
         self.expired = 0
         self.last_expired = None
 
-    def offer(self, rgb, depth, metadata=None):
-        pair = (rgb, depth, self.clock())
+    def offer(self, rgb, depth, metadata=None, *, received=None):
+        pair = (rgb, depth, self.clock() if received is None else received)
         self.latest = pair if metadata is None else pair+(metadata,)
 
     def take(self):
@@ -108,7 +108,7 @@ class RGBReaderWatch:
 
     def observe(self, stamp, arrival_age):
         """'advance', 'unchanged' or 'drop'; never refresh a cached JPEG on rebind."""
-        if self.awaiting and (not math.isfinite(arrival_age) or abs(arrival_age) > self.max_age_s):
+        if not math.isfinite(arrival_age) or abs(arrival_age) > self.max_age_s:
             return 'drop'
         if not self.sequence.inspect(stamp)['accept']:
             # Outside a rebind, preserve normal pair-level clock epoch handling.
@@ -151,40 +151,299 @@ class RGBReaderWatch:
 
 
 class RebindableRGB:
-    """Single-executor lifetime of a compressed RGB reader + per-generation RGB-D queues.
+    """Selective compressed reader rebind; both queues are replaced on any change.
 
-    The persistent depth subscription feeds only the current synchronizer.
-    Retired RGB callbacks cannot update previews or enqueue old depth/RGB pairs.
+    A healthy reader feeds the new synchronizer without being unsubscribed.
+    Retired callbacks cannot update previews or enqueue old messages.
     """
-    def __init__(self, subscribe, destroy, make_filters, observe, clear_pending):
+    def __init__(self, subscribe, destroy, make_filters, observe, clear_pending, subscribe_depth=None):
         self.subscribe, self.destroy = subscribe, destroy
+        self.subscribe_depth = subscribe_depth
         self.make_filters, self.observe, self.clear_pending = make_filters, observe, clear_pending
         self.generation = 0
-        self.rgb_sub = self.depth_sink = None
+        self.rgb_sub = self.depth_sub = self.rgb_sink = self.depth_sink = None
+        self.depth_generation = 0
 
-    def close(self):
-        self.generation += 1
-        self.depth_sink = None
+    def close(self, kinds=('rgb','depth')):
+        self.rgb_sink = self.depth_sink = None
         self.clear_pending()
-        if self.rgb_sub is not None:
-            if self.destroy(self.rgb_sub) is False:
-                raise RuntimeError('Could not retire previous compressed RGB subscription')
-            self.rgb_sub = None
+        for kind in kinds:
+            if kind == 'rgb':
+                self.generation += 1
+            else:
+                self.depth_generation += 1
+            sub = getattr(self, kind+'_sub')
+            if sub is not None:
+                if self.destroy(sub) is False:
+                    raise RuntimeError('Could not retire previous compressed '+kind+' subscription')
+                setattr(self, kind+'_sub', None)
 
-    def rebind(self):
-        self.close()
-        generation = self.generation
-        rgb_sink, depth_sink = self.make_filters()
-
-        def rgb(msg):
-            if generation == self.generation and self.observe(msg, 'rgb'):
-                rgb_sink(msg)
-        self.rgb_sub = self.subscribe(rgb)
-        self.depth_sink = depth_sink
+    def rebind(self, kinds=('rgb','depth')):
+        self.close(kinds)
+        self.rgb_sink, self.depth_sink = self.make_filters()
+        if 'rgb' in kinds:
+            generation = self.generation
+            def rgb(msg):
+                if generation == self.generation and self.rgb_sink and self.observe(msg, 'rgb'):
+                    self.rgb_sink(msg)
+            self.rgb_sub = self.subscribe(rgb)
+        if 'depth' in kinds and self.subscribe_depth:
+            depth_generation = self.depth_generation
+            def depth(msg):
+                if depth_generation == self.depth_generation:
+                    self.depth(msg)
+            self.depth_sub = self.subscribe_depth(depth)
 
     def depth(self, msg):
-        if self.observe(msg, 'depth') and self.depth_sink is not None:
+        if self.depth_sink is not None and self.observe(msg, 'depth'):
             self.depth_sink(msg)
+
+
+class CompressedWatchdog:
+    """Independent, discovery-aware recovery for both camera readers."""
+    def __init__(self, max_age, clock=time.monotonic):
+        self.clock = clock
+        self.streams = {k: RGBReaderWatch(max_age, clock) for k in ('rgb','depth')}
+        self.last_writers = {}
+        self.endpoints = {}
+
+    def poll(self, endpoints, rebind):
+        self.endpoints = endpoints
+        due = []
+        now = self.clock()
+        for k, w in self.streams.items():
+            writers = endpoints.get(k)  # None = graph API unavailable; empty = no publisher.
+            replaced = bool(writers and self.last_writers.get(k) and not writers.intersection(self.last_writers[k]))
+            if writers:
+                self.last_writers[k] = writers
+            if writers is not None and not writers:
+                continue
+            if ((now-w.progress < w.stale_s and not replaced) or
+                    (w.last_attempt is not None and now-w.last_attempt < w.retry_s)):
+                continue
+            due.append(k)
+            w.attempts += 1
+            w.last_attempt, w.awaiting = now, True
+        if due:
+            try:
+                rebind(tuple(due))
+                for k in due:
+                    self.streams[k].last_error = None
+            except Exception as error:
+                for k in due:
+                    self.streams[k].last_error = str(error)[:250]
+
+    def relay_needed(self):
+        for k, w in self.streams.items():
+            age = self.clock()-w.progress
+            other = self.streams['depth' if k == 'rgb' else 'rgb']
+            # If the other compressed stream is still arriving and a reader
+            # rebind hasn't worked, begin setting up the backup a little sooner.
+            sibling_live = other.sequence.last_stamp > 0 and self.clock()-other.progress <= 3.
+            # A dead local DDS discovery path cannot prove the *onboard*
+            # camera is dead. Give discovery longer than ordinary reader repair.
+            if (w.awaiting and age >= (16. if sibling_live else 24.)) or (not self.endpoints.get(k) and age >= 45.):
+                return True
+        return False
+
+    def health(self):
+        report, stale, missing = {}, [], []
+        for k, w in self.streams.items():
+            report.update({name.replace('rgb_reader_', k+'_reader_'): val
+                           for name,val in w.health().items() if name.startswith('rgb_reader_')})
+            pubs = self.endpoints.get(k)
+            report[k+'_publishers'] = None if pubs is None else len(pubs)
+            if pubs is not None and not pubs and self.clock()-w.progress >= w.stale_s:
+                missing.append(k)
+            elif w.awaiting:
+                stale.append(k)
+        if missing:
+            report.update(status='waiting_for_camera_publishers',
+                          last_error='No compressed publisher discovered for '+', '.join(missing))
+        elif stale:
+            label = 'rgbd' if len(stale)==2 else stale[0]
+            report.update(status=label+'_stale', timing_status='awaiting_fresh_compressed_'+label,
+                          last_error='Waiting for fresh compressed '+', '.join(stale)+' stamps after reader rebind')
+        return report
+
+
+def compressed_writer_ids(node, topic):
+    try:
+        return frozenset(bytes(p.endpoint_gid) for p in node.get_publishers_info_by_topic(topic))
+    except (NotImplementedError, RuntimeError):
+        return None
+
+
+class CameraPath:
+    """Exactly one transport supplies observations; probe SSH before cutting DDS."""
+    def __init__(self, mode, readers, make_relay, deliver, clear_pending, clock=time.monotonic):
+        self.mode, self.readers, self.make_relay, self.deliver = mode, readers, make_relay, deliver
+        self.clear_pending, self.clock = clear_pending, clock
+        self.relay = None
+        self.dds_live = False
+        self.retry_at = 0.
+        self.dds_retry_at = 0.
+        self.probe_reason = None
+        self.tf_retry_at = 0.
+        self.last_pose_at = None
+        self.expired_at_last_pose = 0
+        self.started = self.clock()
+        self.last_good = self.generation = None
+        self.last_error = None
+        self.switches = 0
+
+    def start(self):
+        if self.mode == 'always':
+            self._start_relay()
+        else:
+            self.readers.rebind()
+            self.dds_live = True
+
+    def _start_relay(self, reason='camera'):
+        self.probe_reason = reason
+        self.last_good, self.generation = self.clock(), None
+        try:
+            self.relay = self.make_relay()
+            self.relay.start()
+            self.switches += 1
+            self.last_error = None
+        except Exception as error:
+            self._restore_dds(str(error))
+
+    def _restore_dds(self, reason=None, cooldown=8.):
+        self.probe_reason = None
+        self.last_error = reason[:250] if reason else None
+        if self.relay is not None:
+            try:
+                self.relay.close(wait=False)
+            finally:
+                self.relay = None
+        self.retry_at = self.clock()+cooldown
+        if not self.dds_live:
+            try:
+                self.readers.rebind()
+                self.dds_live = True
+            except Exception as error:
+                self.last_error = ((self.last_error or '')+'; DDS reader restore: '+str(error))[:350]
+
+    def watch(self, watchdog, endpoints, expired=0, last_pose=None):
+        now = self.clock()
+        new_pose = last_pose is not None and last_pose != self.last_pose_at
+        if new_pose:
+            self.last_pose_at, self.expired_at_last_pose = last_pose, expired
+        if self.relay is not None:
+            if self.dds_live:
+                watchdog.poll(endpoints, self.readers.rebind)
+                if self.probe_reason == 'tf':
+                    if watchdog.relay_needed():
+                        self.probe_reason = 'camera'
+                    elif new_pose and last_pose >= self.last_good:
+                        self._restore_dds()
+                        return
+                    elif now-self.last_good >= 35.:
+                        self.tf_retry_at = now+60.
+                        self._restore_dds('No fresh relay pair with capture-time pose; retaining DDS', cooldown=0.)
+                        return
+                    else:
+                        return  # Healthy DDS images alone cannot resolve a missing stamped pose.
+            if (self.mode == 'auto' and self.dds_live and
+                    all(w.sequence.last_stamp > 0 and not w.awaiting and
+                        self.clock()-w.progress < w.stale_s for w in watchdog.streams.values())):
+                # Both original readers recovered while SSH was authenticating.
+                self._restore_dds()
+            return
+        watchdog.poll(endpoints, self.readers.rebind)
+        if (self.clock() >= self.retry_at and
+                (self.mode == 'always' or self.mode == 'auto' and watchdog.relay_needed())):
+            self._start_relay()
+        elif (self.mode == 'auto' and self.dds_live and now >= max(self.retry_at,self.tf_retry_at)
+              and expired-self.expired_at_last_pose >= 2
+              and now-(self.started if self.last_pose_at is None else self.last_pose_at) >= 12.
+              and all(w.sequence.last_stamp > 0 and not w.awaiting and now-w.progress < w.stale_s
+                      for w in watchdog.streams.values())):
+            # Only real expired acquisitions, not a transient future-TF message,
+            # justify probing. Keep healthy full-size DDS unless the backup can
+            # actually deliver the original acquisition with a measured pose.
+            self._start_relay('tf')
+
+    def poll(self):
+        if self.relay is None:
+            return
+        try:
+            pair = self.relay.poll()
+            if pair is not None and not (self.dds_live and self.probe_reason == 'tf' and getattr(pair, 'pose', None) is None):
+                if self.dds_live:
+                    # poll() only releases pairs with valid age, skew and
+                    # calibration metadata. Retire old callback generations and
+                    # clear synchronization queues before offering relay inputs.
+                    self.dds_live = False
+                    self.readers.close()
+                if self.generation != pair.generation:
+                    self.clear_pending()
+                    self.generation = pair.generation
+                if self.deliver(pair):
+                    self.last_good = self.clock()
+                    self.probe_reason = None
+        except Exception as error:
+            self.last_error = str(error)[:250]
+        failure = self.relay.status().get('last_error')
+        if failure and any(x in failure.lower() for x in ('authentication', 'denied', 'host key')):
+            # Do not repeatedly interrupt a healthy depth stream or hammer SSH
+            # while a password is wrong or the host key needs attention.
+            self._restore_dds(failure, cooldown=300.)
+            return
+        now = self.clock()
+        if not self.dds_live and now-self.last_good >= 12. and now >= self.dds_retry_at:
+            # Restore DDS without destroying the retrying SSH connection. A
+            # 45 s teardown followed by 60 s of DDS-only backoff stranded the
+            # rover when only SSH was able to deliver advancing captures.
+            self.dds_retry_at = now+12.
+            try:
+                self.readers.rebind()
+                self.dds_live = True
+            except Exception as error:
+                self.last_error = ('DDS reader restore: '+str(error))[:250]
+
+    def health(self):
+        result = dict(camera_transport='ssh_compressed_pair' if self.relay is not None and not self.dds_live else 'dds_compressed',
+                      camera_relay_probing=self.relay is not None and self.dds_live,
+                      camera_relay_probe_reason=self.probe_reason,
+                      camera_relay_mode=self.mode, camera_relay_switches=self.switches,
+                      camera_relay_last_error=self.last_error)
+        if self.relay is not None:
+            result['camera_relay'] = self.relay.status()
+        return result
+
+    def close(self):
+        try:
+            if self.relay is not None:
+                self.relay.close()
+                self.relay = None
+        finally:
+            self.readers.close()
+
+
+def offer_relay_pair(pair, seen, pending, max_age_s, slop_s, now):
+    """Offer only original synchronized, time-valid messages and calibration.
+
+    Apply the same per-stream advancement checks as DDS; never substitute the
+    tunnel receipt time for the camera stamp or the poll time for receipt.
+    """
+    elapsed = now-pair.received_monotonic
+    rgb, depth = pair.rgb, pair.depth
+    rs, ds = stamp_ns(rgb.header.stamp), stamp_ns(depth.header.stamp)
+    if (not 0 <= elapsed <= max_age_s or min(rs, ds) <= 0 or abs(rs-ds) > slop_s*1e9 or
+            any(abs((pair.received_wall_ns-stamp)/1e9) > max_age_s for stamp in (rs, ds))):
+        return False
+    rgb_ok, depth_ok = seen(rgb, 'rgb'), seen(depth, 'depth')
+    if not (rgb_ok and depth_ok):
+        return False
+    pending.offer(rgb, depth, dict(received_wall_ns=pair.received_wall_ns,
+                                   relay_pose=getattr(pair, 'pose', None),
+                                   relay_mount=getattr(pair, 'mount', None),
+                                   calibration=dict(rgb=pair.rgb_info, depth=pair.depth_info)),
+                  received=pair.received_monotonic)
+    return True
 
 
 def stamp_ns(stamp):
@@ -221,7 +480,8 @@ def require_compressed_transport(robot):
         raise ValueError('Live collaborative adapters require compressed RGB and compressedDepth transport')
 
 
-def pair_timing(depth_stamp_ns, received_wall_ns, received_monotonic, now_monotonic, max_age_s):
+def pair_timing(depth_stamp_ns, received_wall_ns, received_monotonic, now_monotonic, max_age_s,
+                tf_wait_budget_s=None):
     """Distinguish acquisition/transport header age from adapter TF waiting.
 
     Header age at receipt includes transport latency AND possible clock offset;
@@ -234,7 +494,7 @@ def pair_timing(depth_stamp_ns, received_wall_ns, received_monotonic, now_monoto
         status = 'frame_stale_on_arrival'
     elif arrival < -max_age_s:
         status = 'sensor_timestamp_ahead_of_receiver'
-    elif max(0., arrival)+wait > max_age_s:
+    elif (wait > tf_wait_budget_s if tf_wait_budget_s is not None else max(0., arrival)+wait > max_age_s):
         status = 'timestamped_tf_wait_expired'
     else:
         status = 'within_latency_budget'
@@ -407,7 +667,7 @@ def prepare_registered_rgbd(rgb_msg, depth_msg, robot, settings, calibration, lo
                 camera_frame=rgb_frame, local_frame=robot['local_frame'], depth_registration=registration)
 
 
-def run_adapter(robot, settings, output, health_output, stop_event):
+def run_adapter(robot, settings, output, health_output, stop_event, relay_password=None):
     """Spawn target. Subscribes only; never publishes to a robot domain."""
     require_compressed_transport(robot)
     import rclpy
@@ -438,25 +698,35 @@ def run_adapter(robot, settings, output, health_output, stop_event):
     last_preview = dict(rgb=0., depth=0.)
     last_model_preview = 0.
     last_tf_diagnostic = 0.
-    pending = PendingPair(settings['max_age_s'])
-    rgb_watch = RGBReaderWatch(settings['max_age_s'])
+    tf_wait_budget = settings['tf_wait_budget_s']
+    state['tf_wait_budget_s'] = tf_wait_budget
+    pending = PendingPair(tf_wait_budget)
+    watchdog = CompressedWatchdog(settings['max_age_s'])
     seq = 0
     qos = qos_profile_sensor_data
     qos.depth = int(settings["qos_depth"])
 
-    def image_seen(msg, kind):
+    def image_seen(msg, kind, allow_reordering=True):
         now = time.monotonic()
         stamp = stamp_ns(msg.header.stamp)
         state[f"last_{kind}_monotonic"] = now
         arrival_age = (node.get_clock().now().nanoseconds-stamp)/1e9
-        if kind == 'rgb':
-            progress = rgb_watch.observe(stamp, arrival_age)
-            if progress != 'advance':
-                return progress != 'drop'
+        state[f'{kind}_header_age_at_receipt_s'] = arrival_age
+        progress = watchdog.streams[kind].observe(stamp, arrival_age)
+        if progress != 'advance':
+            if abs(arrival_age) > settings['max_age_s']:
+                state.update(status='input_rejected', last_error=f'{kind} source stamp outside receiver age budget ({arrival_age:.2f}s)')
+            # ROS can deliver a current acquisition slightly out of order:
+            # it may still be the closest match for the other camera. Permit
+            # bounded reordering into the synchronizer only, without refreshing
+            # the JPEG/health or fulfilling a rebind. Mapping enforces its own
+            # committed (rather than last received) pair sequence.
+            behind = watchdog.streams[kind].sequence.last_stamp-stamp
+            return bool(allow_reordering and progress == 'unchanged' and
+                        0 < behind < max(.25, settings['sync_slop_s']*2)*1e9)
         if state.get(f"{kind}_stamp_ns") != stamp:
             state[f"{kind}_advanced_monotonic"] = now
         state[f"{kind}_stamp_ns"] = stamp
-        state[f'{kind}_header_age_at_receipt_s'] = arrival_age
         if now-last_preview[kind] >= .5:
             last_preview[kind] = now
             try:
@@ -507,7 +777,8 @@ def run_adapter(robot, settings, output, health_output, stop_event):
                 raise ValueError("missing sensor timestamps")
             if abs(rgb_stamp-depth_stamp) > settings["sync_slop_s"]*1e9:
                 raise ValueError("RGB/depth timestamp skew exceeds configured tolerance")
-            timing = pair_timing(depth_stamp, metadata['received_wall_ns'], received, now, settings['max_age_s'])
+            timing = pair_timing(depth_stamp, metadata['received_wall_ns'], received, now, settings['max_age_s'],
+                                 tf_wait_budget)
             state.update(timing)
             # Backward-compatible field now correctly means immutable arrival age.
             state['sensor_clock_age_s'] = timing['selected_frame_age_at_receipt_s']
@@ -529,11 +800,20 @@ def run_adapter(robot, settings, output, health_output, stop_event):
             if not rgb_frame:
                 raise ValueError('RGB optical frame ID is missing')
             pose, pose_error = None, None
+            pose_source = 'dds_tf'
             try:
-                pose = tf_matrix(buffer.lookup_transform(robot['local_frame'], rgb_frame,
-                    Time.from_msg(depth_msg.header.stamp), timeout=Duration(seconds=0)))
+                source_pose = metadata.get('relay_pose')
+                if source_pose is not None:
+                    # Validated upstream against this exact stamp, frame pair,
+                    # and a proper rigid matrix. Never reuse for another pair.
+                    pose = np.asarray(source_pose['matrix'], dtype=np.float64)
+                    pose_source = 'source_tf'
+                else:
+                    pose = tf_matrix(buffer.lookup_transform(robot['local_frame'], rgb_frame,
+                        Time.from_msg(depth_msg.header.stamp), timeout=Duration(seconds=0)))
             except tf2_ros.TransformException as error:
                 pose_error = error
+                metadata['awaited_tf'] = True
                 tf_wait(error, rgb_frame, depth_stamp, timing['pending_wait_s'])
                 grace = min(.35, settings['max_age_s']*.5)
                 if metadata.get('preview_sent') or timing['pending_wait_s'] < grace or now-last_model_preview < 1.:
@@ -542,7 +822,7 @@ def run_adapter(robot, settings, output, health_output, stop_event):
                 return tf_matrix(buffer.lookup_transform(target, source,
                     Time.from_msg(depth_msg.header.stamp), timeout=Duration(seconds=0)))
             payload = cached_rgbd(metadata, lambda: prepare_registered_rgbd(
-                rgb_msg, depth_msg, robot, settings, calibration, lookup_extrinsic))
+                rgb_msg, depth_msg, robot, settings, metadata.get('calibration', calibration), lookup_extrinsic))
             if decision['reset'] and not metadata.get('session_reset_applied'):
                 state['session_id'] = str(uuid.uuid4())
                 state['session_reset_reason'] = decision['reason']
@@ -556,7 +836,7 @@ def run_adapter(robot, settings, output, health_output, stop_event):
                           integration_allowed=pose is not None,
                           pose_quality='external_tf_not_validated' if pose is not None else dict(
                               status='timestamped_tf_unavailable', integration_allowed=False, reason=str(pose_error)[:250]),
-                          transport_timing=timing)
+                          transport_timing=dict(timing, pose_source=pose_source if pose is not None else None))
             if pose is None:
                 if preview_put(output, packet):
                     metadata['preview_sent'] = True
@@ -565,6 +845,24 @@ def run_adapter(robot, settings, output, health_output, stop_event):
                     state['model_previews_offered'] = state.get('model_previews_offered', 0)+1
                     state['last_model_preview_monotonic'] = now
                 return None  # Retain this pair for a possible timestamped-TF completion.
+            # Retain acquisition and receipt times. Pose-complete work gets a
+            # separate bounded dispatch budget; previews never get this stamp.
+            # This optional measurement only locates the body for visualization.
+            # A missing body transform must not block otherwise valid RGB-D.
+            try:
+                mount = metadata.get('relay_mount')
+                packet['T_camera_base'] = (np.asarray(mount['matrix'], dtype=np.float64) if mount is not None
+                                           else lookup_extrinsic(rgb_frame, robot.get('base_frame','base_footprint')))
+            except (tf2_ros.TransformException, ValueError):
+                pass  # dashboard labels camera-only poses explicitly
+            packet['pose_ready_monotonic'] = time.monotonic()
+            state['last_pose_source'] = pose_source
+            if pose_source == 'source_tf':
+                state['source_tf_pairs'] = state.get('source_tf_pairs', 0)+1
+            if metadata.get('awaited_tf'):
+                state['tf_resolved_wait_s'] = timing['pending_wait_s']
+                if timing['selected_frame_age_s'] > settings['max_age_s']:
+                    state['tf_delayed_recovered'] = state.get('tf_delayed_recovered', 0)+1
             if latest_put(output, packet):
                 state["offered"] += 1
             sequencing.commit(depth_stamp)
@@ -587,6 +885,7 @@ def run_adapter(robot, settings, output, health_output, stop_event):
         pending.offer(rgb_msg, depth_msg, dict(received_wall_ns=node.get_clock().now().nanoseconds))
 
     def process_pending():
+        path.poll()
         # Don't pin a pair during rate limiting: choose the freshest pair when
         # capacity is available, then retain it only while TF catches up.
         if time.monotonic()-last_offer < 1./float(settings['max_hz']):
@@ -615,14 +914,34 @@ def run_adapter(robot, settings, output, health_output, stop_event):
         return rgb_filter.signalMessage, depth_filter.signalMessage
 
     readers = RebindableRGB(lambda cb: node.create_subscription(CompressedImage, robot['rgb_topic'], cb, qos),
-                            node.destroy_subscription, make_filters, image_seen, pending.clear)
-    readers.rebind()
-    subscriptions.append(node.create_subscription(CompressedImage, robot['depth_topic'], readers.depth, qos))
+                            node.destroy_subscription, make_filters, image_seen, pending.clear,
+                            lambda cb: node.create_subscription(CompressedImage, robot['depth_topic'], cb, qos))
+
+    def make_relay():
+        from collab_camera_relay import CameraRelay
+        return CameraRelay(robot, settings, relay_password) if relay_password is not None else CameraRelay(robot, settings)
+
+    def deliver_relay(pair):
+        accepted = offer_relay_pair(pair, lambda msg, kind: image_seen(msg, kind, False),
+                                    pending, settings['max_age_s'],
+                                    settings['sync_slop_s'], time.monotonic())
+        if accepted:
+            state['received'] += 1
+        return accepted
+
+    path = CameraPath(robot.get('camera_relay', {}).get('mode', 'off'), readers, make_relay,
+                      deliver_relay, pending.clear)
+    path.start()
 
     def report_health():
-        rgb_watch.poll(state.get('depth_advanced_monotonic'), state.get('depth_header_age_at_receipt_s'), readers.rebind)
+        if path.relay is None or path.dds_live:
+            writers = {k: compressed_writer_ids(node, robot[k+'_topic']) for k in ('rgb','depth')}
+            path.watch(watchdog, writers, state.get('tf_wait_expired', 0), state.get('last_packet_monotonic'))
         # Input health takes priority over a now-irrelevant cached TF error.
-        latest_put(health_output, {**state, **rgb_watch.health(), 'reported_monotonic': time.monotonic()})
+        health = watchdog.health()
+        if path.relay is not None and any(s.awaiting for s in watchdog.streams.values()):
+            health.update(status='waiting_for_camera_relay', last_error='Waiting for fresh synchronized compressed relay images')
+        latest_put(health_output, {**state, **health, **path.health(), 'reported_monotonic': time.monotonic()})
     prepare_timer = node.create_timer(max(.01, min(.05, float(settings['tf_timeout_s']) or .05)), process_pending)
     timer = node.create_timer(1., report_health)
     executor = SingleThreadedExecutor(context=context)
@@ -634,7 +953,7 @@ def run_adapter(robot, settings, output, health_output, stop_event):
         pass
     finally:
         try:
-            readers.close()
+            path.close()
         finally:
             listener.unregister()
             executor.shutdown()

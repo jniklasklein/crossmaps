@@ -243,6 +243,16 @@ class DiagnosticTransportTests(unittest.TestCase):
         self.assertEqual(stale['timing_status'], 'frame_stale_on_arrival')
         self.assertEqual(future['timing_status'], 'sensor_timestamp_ahead_of_receiver')
 
+    def test_delayed_exact_tf_has_separate_bounded_deadline_for_fresh_inputs_only(self):
+        def status(arrival, wait):
+            return pair_timing(100_000_000_000, int((100+arrival)*1e9), 50., 50.+wait, 2., 6.)
+        recovered = status(1.35, 4.34)
+        self.assertEqual(recovered['timing_status'], 'within_latency_budget')
+        self.assertAlmostEqual(recovered['selected_frame_age_s'], 5.69)
+        self.assertEqual(status(2.1, 0)['timing_status'], 'frame_stale_on_arrival')
+        self.assertEqual(status(-2.1, 0)['timing_status'], 'sensor_timestamp_ahead_of_receiver')
+        self.assertEqual(status(.4, 6.01)['timing_status'], 'timestamped_tf_wait_expired')
+
     def test_preview_never_evicts_mapping_but_mapping_replaces_preview(self):
         channel = queue.Queue(maxsize=1)
         self.assertTrue(latest_put(channel, dict(preview_only=False, seq=1)))

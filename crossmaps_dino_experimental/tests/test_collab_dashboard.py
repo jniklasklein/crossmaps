@@ -57,6 +57,28 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.request(path="/api/image?robot=../../file&view=rgb")[0], 400)
         self.assertEqual(self.request(path="/api/image?robot=A&view=../../file")[0], 400)
 
+    def test_age_belongs_to_the_served_image_only(self):
+        self.dashboard.image_provider = lambda *_: (b'old', 'image/jpeg', 188.75)
+        status, headers, data = self.request(path="/api/image?robot=A&view=rgb")
+        self.assertEqual((status, headers["X-CrossMaps-Image-Age-S"], data), (200, "188.750", b'old'))
+        self.dashboard.image_provider = lambda *_: (b'recorded', 'image/jpeg', None)
+        self.assertNotIn("X-CrossMaps-Image-Age-S", self.request(path="/api/image?robot=A&view=rgb")[1])
+        self.dashboard.image_provider = lambda *_: (b'bad', 'image/jpeg', float('nan'))
+        self.assertEqual(self.request(path="/api/image?robot=A&view=rgb")[0], 500)
+
+    def test_identity_evidence_gets_are_scoped_and_read_only(self):
+        link, member, frame = 'a'*20, 'b'*20, 'c'*20
+        self.dashboard.identity_provider = lambda key: {'id': key, 'state': 'proposed'} if key == link else None
+        self.dashboard.witness_provider = lambda *ids: b'witness-jpeg' if ids == (link, member, frame) else None
+        root = '/api/identity/'
+        status, headers, data = self.request(path=root+link)
+        self.assertEqual((status, json.loads(data)['id']), (200, link))
+        status, headers, data = self.request(path=f'{root}{link}/{member}/{frame}.jpg')
+        self.assertEqual((status, headers['Content-Type'], data), (200, 'image/jpeg', b'witness-jpeg'))
+        for path in (member, f'{link}/{frame}/{member}.jpg', f'{link}/../{frame}.jpg', 'state.json', link+'extra'):
+            self.assertEqual(self.request(path=root+path)[0], 404)
+        self.assertEqual(self.commands, [])
+
     def test_token_required_and_valid_command(self):
         payload = json.dumps({"action": "set_shadow_mode", "enabled": True})
         self.assertEqual(self.request("POST", "/api/command", payload, {"Content-Type": "application/json"})[0], 403)

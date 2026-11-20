@@ -34,8 +34,8 @@ class AdapterRosSmokeTests(unittest.TestCase):
         self.rclpy = rclpy
         self.channels = []
         self.config = validate_config({"central_domain": 88, "robots": [
-            {"id": "smoke_a", "domain": 86}, {"id": "smoke_b", "domain": 87}],
-            "input": {"max_hz": 10., "max_age_s": 10., "tf_timeout_s": .3}})
+            {"id": "smoke_a", "domain": 86, "base_frame": "base_link"}, {"id": "smoke_b", "domain": 87}],
+            "input": {"max_hz": 10., "max_age_s": 2., "tf_timeout_s": .3}})
         self.mp = multiprocessing.get_context("spawn")
         self.addCleanup(self._cleanup)
         for robot in self.config["robots"]:
@@ -213,6 +213,13 @@ class AdapterRosSmokeTests(unittest.TestCase):
             np.testing.assert_allclose(packet["rgb"][0, 0], color, atol=3)
             np.testing.assert_allclose(packet["depth"], depth_m, atol=1e-5)
             np.testing.assert_allclose(packet["T_local_camera"][:3, 3], pose, atol=1e-6)
+            if source is first:
+                np.testing.assert_allclose(packet["T_camera_base"][:3, 3], [-.1, 0., -.2], atol=1e-6)
+                np.testing.assert_allclose((packet["T_local_camera"] @ packet["T_camera_base"])[:3, 3],
+                                           [1., 2., .3], atol=1e-6)
+            else:
+                # An unknown base frame must not suppress valid RGB-D or claim a body pose.
+                self.assertNotIn("T_camera_base", packet)
             np.testing.assert_allclose(packet["K"], [[45., 0., 24.], [0., 45., 16.], [0., 0., 1.]])
         self.assertNotEqual(a["session_id"], b["session_id"])
         self._pair(first, (10, 30, 230), 1.4, (1.05, 2., .3))
@@ -239,6 +246,7 @@ class AdapterRosSmokeTests(unittest.TestCase):
         self.assertEqual(preview['stamp_ns'], stamp)
         self.assertEqual(preview['depth_registration'], 'same_optical_frame')
         self.assertGreaterEqual(preview['transport_timing']['pending_wait_s'], .35)
+        self._spin_for(2.1)  # TF is later than the complete camera freshness budget.
         capture = self._tf(self._stamp(stamp), 'odom', 'base_link', (3., 1., .4))
         later = self._tf(source.node.get_clock().now().to_msg(), 'odom', 'base_link', (30., 1., .4))
         source.tf.sendTransform([capture, later])
@@ -246,6 +254,7 @@ class AdapterRosSmokeTests(unittest.TestCase):
         self.assertFalse(mapped['preview_only'])
         self.assertTrue(mapped['integration_allowed'])
         self.assertEqual(mapped['stamp_ns'], preview['stamp_ns'])
+        self.assertGreater(mapped['pose_ready_monotonic']-mapped['received_monotonic'], 2.)
         self.assertGreater(mapped['seq'], preview['seq'])
         np.testing.assert_allclose(mapped['T_local_camera'][:3, 3], [3.1, 1., .6], atol=1e-6)
 

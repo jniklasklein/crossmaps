@@ -276,7 +276,8 @@ class CollaborativeBackendTests(unittest.TestCase):
         backend.ingest(observation('A', seq=2))
         backend.ingest(observation('B'))
         summary = backend.snapshot()['alignment_evidence']
-        self.assertEqual(summary, dict(retrieved=2, checked=1, verified=1, active=0, best_rejection=None))
+        self.assertEqual(summary, dict(retrieved=2, checked=1, verified=1, active=0, best_rejection=None,
+                                       provisional=[], provisional_diagnostics=[]))  # shadow mode
 
     def test_recent_target_gets_a_bounded_proposal_not_a_free_verification(self):
         backend = Backend(dict(candidate_top_k=1, verifications_per_keyframe=2))

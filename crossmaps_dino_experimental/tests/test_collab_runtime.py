@@ -8,6 +8,20 @@ from collab_runtime import CycleTiming, FairLatestScheduler
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_camera_relay_is_explicit_compressed_only_and_has_no_credential_fields(self):
+        def robot(**opts):
+            return dict(id="alpha", domain=1, **opts)
+        def parse(r):
+            return validate_config({"robots": [r]})['robots'][0]['camera_relay']
+        self.assertEqual(parse(robot())['mode'], 'off')
+        settings = dict(mode='auto', ssh_host='jetson@test-rover')
+        self.assertEqual(parse(robot(camera_relay=settings))['max_hz'], 1.5)
+        for override in (dict(mode='auto', ssh_host=''), dict(mode='raw'), dict(container='a; b'),
+                         dict(ssh_host='-Ffile'), dict(max_hz=60), dict(password='invalid'), dict(image_stride=True), dict(image_stride=5)):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                parse(robot(camera_relay=dict(settings, **override)))
+        with self.assertRaises(ValueError):
+            parse(robot(camera_relay=settings, rgb_topic='/oak/rgb/image_raw'))
     def test_defaults_isolate_domains_and_do_not_mutate_input(self):
         supplied = {"robots": [{"id": "alpha", "domain": 4}, {"id": "beta", "domain": 7}]}
         before = copy.deepcopy(supplied)
@@ -147,6 +161,19 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.scheduler.take()["seq"], 7)
         self.assertFalse(self.scheduler.offer(self.packet(seq=7)))
         self.assertEqual(self.scheduler.snapshot()["a"]["duplicate"], 4)
+
+    def test_exact_pose_completion_survives_wait_but_cannot_queue_indefinitely(self):
+        def completed(seq):
+            return dict(self.packet(seq=seq, received=95.), pose_ready_monotonic=99.9,
+                        integration_allowed=True, T_local_camera=object())
+        self.scheduler.offer(completed(1))
+        self.assertFalse(self.scheduler.offer(dict(self.packet(seq=2), preview_only=True)))
+        self.assertEqual(self.scheduler.take()['received_monotonic'], 95.)
+        self.scheduler.offer(completed(3))
+        self.now += 2.
+        self.assertIsNone(self.scheduler.take())
+        self.scheduler.offer(dict(completed(4), preview_only=True, pose_ready_monotonic=self.now))
+        self.assertIsNone(self.scheduler.take())
 
     def test_restart_accepts_new_epoch_and_rejects_retired_epoch_forever(self):
         self.scheduler.offer(self.packet(seq=99, session="old"))

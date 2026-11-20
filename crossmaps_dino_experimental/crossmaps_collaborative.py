@@ -41,7 +41,12 @@ class FleetApplication:
             self.backend = Backend.replay(self.run_dir / 'evidence')
         else:
             self.run_dir.mkdir(parents=True, exist_ok=True)
-            self.backend = Backend(config.get('backend'), self.run_dir / 'evidence')
+            backend_options = dict(config['backend'])
+            if (self.run_dir / 'evidence' / 'state.json').is_file():
+                # A recording's config.json describes how it STARTED. The last
+                # checkpoint has the actual operator decision at shutdown.
+                backend_options.pop('shadow_mode', None)
+            self.backend = Backend(backend_options, self.run_dir / 'evidence')
         self.backend_lock = threading.RLock()
         self.state_lock = threading.RLock()
         self.cached = self.backend.snapshot()
@@ -59,12 +64,15 @@ class FleetApplication:
         self.adapters = {}
         self.mp_context = mp.get_context('spawn')
         self.input_stop = self.mp_context.Event()
-        self.dashboard = CollaborativeDashboard(self.snapshot, self.command, self.image,
+        self.dashboard = CollaborativeDashboard(self.snapshot, self.command, self._image_response,
+                                                identity_provider=self.identity_inspection,
+                                                witness_provider=self.witness_image,
                                                 **config['dashboard'])
         self.active_robot = None
         self.active_since = None
         self.publisher_node = self.state_pub = None
         self.started = time.monotonic()
+        self.next_idle_verification = self.started + 8.
         self.last_ros_publish = 0.
         self._closed = False
         if replay:
@@ -99,7 +107,7 @@ class FleetApplication:
         with self.state_lock:
             state = self.telemetry[robot]
             if state.get('session_id') != observation['session_id']:
-                for key in ('last_mapped_monotonic', 'last_processed_monotonic', 'last_processed_stamp_ns',
+                for key in ('last_mapped_monotonic', 'map_finished_monotonic', 'last_processed_monotonic', 'last_processed_stamp_ns',
                             'pose_quality', 'counts', 'last_error'):
                     state.pop(key, None)
             # Live adapters supply camera previews asynchronously. Demo and direct
@@ -135,9 +143,18 @@ class FleetApplication:
                 enriched = self.fleet.process(observation)
                 inference_elapsed = time.monotonic()-started
             preview_only = observation.get('preview_only', False)
-            if not preview_only:
+            if preview_only:
                 with self.backend_lock:
+                    if self.backend.mark_trajectory_gap(robot, observation['session_id']):
+                        snapshot = self.backend.snapshot()
+                        with self.state_lock:
+                            self.cached = snapshot
+            else:
+                with self.backend_lock:
+                    previous_count = len(self.backend.keyframes)
                     snapshot = self.backend.ingest(enriched)
+                    if len(self.backend.keyframes) != previous_count:
+                        self.next_idle_verification = time.monotonic() + 8.
                     with self.state_lock:
                         self.cached = snapshot
             finished = time.monotonic()
@@ -152,6 +169,9 @@ class FleetApplication:
                 allowed = not preview_only and enriched.get('integration_allowed', True)
                 if allowed:
                     state['last_mapped_monotonic'] = observation['received_monotonic']
+                    # Input age and time since integration are different when
+                    # waiting for measured TF or sharing the inference worker.
+                    state['map_finished_monotonic'] = finished
                 status = 'waiting_for_tf' if preview_only else 'healthy' if allowed else 'pose_rejected'
                 state.update(status=status,
                     last_processed_monotonic=finished,
@@ -174,21 +194,48 @@ class FleetApplication:
             with self.state_lock:
                 self.active_robot = self.active_since = None
 
+    def _idle_verification(self):
+        """Give one skipped pair a turn in a quiet live session. Never invent input."""
+        now = time.monotonic()
+        if (self.demo or self.replay or self.stop_event.is_set() or now < self.next_idle_verification or
+                any(q['pending'] for q in self.scheduler.snapshot().values())):
+            return False
+        self.next_idle_verification = now + 8.
+        try:
+            with self.backend_lock:
+                with self.state_lock:
+                    # A new adapter can arrive before its first valid pose.
+                    # Don't confirm a previous session's previews in that gap.
+                    for robot, sid in self.backend.robots.items():
+                        if self.telemetry.get(robot, {}).get('session_id') != self.backend.sessions[sid]['session_id']:
+                            return False
+                if not self.backend.backfill_one():
+                    return False
+                snapshot = self.backend.snapshot()
+                with self.state_lock:
+                    self.cached = snapshot
+                return True
+        except Exception as error:
+            self.event('verification_error', f'Idle verification: {type(error).__name__}: {error}')
+            return False
+
     def _work(self):
         while not self.stop_event.is_set():
             if not self.process_one():
+                self._idle_verification()
                 self.stop_event.wait(.05)
 
-    def _start_adapters(self):
+    def _start_adapters(self, relay_passwords=None):
         for robot in self.config['robots']:
             output, health = self.mp_context.Queue(maxsize=1), self.mp_context.Queue(maxsize=2)
             process = self.mp_context.Process(target=run_adapter,
-                args=(robot, self.config['input'], output, health, self.input_stop),
+                args=(robot, self.config['input'], output, health, self.input_stop,
+                      (relay_passwords or {}).get(robot['id'])),
                 name=f"crossmaps-input-{robot['id']}", daemon=True)
             process.start()
             self.adapters[robot['id']] = dict(process=process, output=output, health=health)
 
-    def start(self, live=True):
+    def start(self, live=True, relay_passwords=None):
         self.dashboard.start()
         try:
             if live and not self.replay:
@@ -200,7 +247,7 @@ class FleetApplication:
                 rclpy.init(args=[], context=self.context, domain_id=self.config['central_domain'])
                 self.publisher_node = Node('crossmaps_collaborative_server', context=self.context)
                 self.state_pub = self.publisher_node.create_publisher(String, '/crossmaps/collaboration/state', 1)
-                self._start_adapters()
+                self._start_adapters(relay_passwords)
             if not self.replay:
                 self.worker = threading.Thread(target=self._work, name='shared-perception', daemon=True)
                 self.worker.start()
@@ -235,6 +282,11 @@ class FleetApplication:
             snapshot = self.snapshot()
             # ROS diagnostics carry metadata, never a second dense-map stream.
             snapshot.pop('submaps', None)
+            for rover in snapshot.get('robots', []):
+                # Full trails belong to the HTTP spatial viewer, not the
+                # periodic ROS diagnostics broadcast on the laptop network.
+                if isinstance(rover.get('trajectory'), dict):
+                    rover['trajectory'].pop('segments', None)
             for entity in snapshot.get('global_entities', []):
                 entity.pop('points', None); entity.pop('colors', None)
             msg = String()
@@ -247,6 +299,7 @@ class FleetApplication:
         with self.state_lock:
             snapshot = deepcopy(self.cached)
             indexed = {r['robot_id']: r for r in snapshot.get('robots', [])}
+            replaced = set()
             robots = []
             for settings in self.config['robots']:
                 robot = settings['id']
@@ -254,7 +307,9 @@ class FleetApplication:
                 data['mapping_status'] = data.get('status')
                 if (data.get('session_id') and self.telemetry[robot].get('session_id')
                         and data['session_id'] != self.telemetry[robot]['session_id']):
-                    data.update(aligned=False, T_world_local=None, keyframes=0, submaps=0,
+                    replaced.add(robot)
+                    data.update(aligned=False, alignment_state='unaligned', source_id=None,
+                                T_world_local=None, T_world_camera=None, trajectory=None, keyframes=0, submaps=0,
                                 mapping_status='new_session_pending')
                 data.update(deepcopy(self.telemetry[robot]))
                 advanced = data.get('health', {}).get('rgb_advanced_monotonic', data.get('last_frame_monotonic'))
@@ -262,12 +317,28 @@ class FleetApplication:
                 data['observation_age_s'] = None if 'last_processed_monotonic' not in data else round(now-data['last_processed_monotonic'], 2)
                 mapped = data.get('last_mapped_monotonic')
                 data['map_observation_age_s'] = None if mapped is None else round(now-mapped, 2)
+                finished = data.get('map_finished_monotonic')
+                data['map_update_age_s'] = None if finished is None else round(now-finished, 2)
                 data['timing'] = self.timing[robot].snapshot()
                 data['timing_ms'] = data['timing']
                 data['image_age_s'] = {view: round(now-stamp, 2) for (source, view), (_, stamp) in self.images.items() if source == robot}
                 if data['frame_age_s'] is not None and data['frame_age_s'] > 5 and data['status'] not in ('adapter_exited', 'processing_error', 'input_rejected'):
                     data['status'] = 'input_stale'
                 robots.append(data)
+            # A new adapter session can arrive before its first accepted RGB-D
+            # pose. Don't render a cached preview against either old endpoint.
+            # Keep the recorded, confirmed map history and backend untouched.
+            if replaced:
+                evidence = snapshot['alignment_evidence']
+                for field in ('provisional', 'provisional_diagnostics'):
+                    evidence[field] = [r for r in evidence.get(field, [])
+                                       if not replaced.intersection((r['source_robot'], r['target_robot']))]
+                visible = {r['source_robot'] for r in evidence['provisional']}
+                for item in [*robots, *snapshot['submaps']]:
+                    if item.get('alignment_state') == 'provisional' and item['robot_id'] not in visible:
+                        item['alignment_state'] = 'unaligned'
+                        if 'T_preview_world_submap' in item:
+                            item['T_preview_world_submap'] = None
             if self.replay:
                 for data in robots:
                     data.update(status='recorded', frame_age_s=None, observation_age_s=None,
@@ -292,14 +363,28 @@ class FleetApplication:
         return snapshot
 
     def image(self, robot, view):
+        response = self._image_response(robot, view)
+        return response[:2] if response is not None else None
+
+    def _image_response(self, robot, view):
         if robot not in self.telemetry:
             return None
         with self.state_lock:
             result = self.images.get((robot, view))
             session = self.telemetry[robot].get('session_id')
             if result is None and self.fleet and session:
-                result = self.fleet.get_image(robot, view, session_id=session)
-        return None if result is None else (result[0], 'image/jpeg')
+                result = self.fleet.image_with_receipt(robot, view, session_id=session)
+        if result is None:
+            return None
+        return (result[0], 'image/jpeg', None if self.replay else max(0., time.monotonic() - result[1]))
+
+    def identity_inspection(self, link):
+        with self.backend_lock:
+            return self.backend.identity_inspection(link)
+
+    def witness_image(self, link, member, frame):
+        with self.backend_lock:
+            return self.backend.identity_evidence_image(link, member, frame)
 
     def command(self, command):
         if self.replay and command.get('action') == 'save':
@@ -370,20 +455,46 @@ def main(argv=None):
     parser.add_argument('--run-dir', help='Child of experimental/.runtime/collaboration; a new directory by default')
     parser.add_argument('--resume', action='store_true', help='Resume evidence in --run-dir; new rover sessions are kept separate')
     parser.add_argument('--demo', action='store_true', help='Synthetic two-source demo, no ROS, models, or robot connections')
+    parser.add_argument('--shadow-mode', action='store_true',
+                        help='Start a new run in review-only mode for cross-rover decisions (live default: automatic alignment)')
     parser.add_argument('--replay', metavar='RUN_DIR', help='Inspect a saved run without ROS/models or changing the recording')
     parser.add_argument('--check', action='store_true', help='Validate config/dependencies without connecting to robots')
     parser.add_argument('--port', type=int, help='Override loopback dashboard port (default 8766)')
     parser.add_argument('--duration', type=float, help='Stop after this many seconds (useful for tests)')
+    parser.add_argument('--prompt-relay-password', action='store_true',
+                        help='Force a private, session-only SSH password prompt instead of automatic key/Keychain lookup')
+    parser.add_argument('--setup-relay-auth', action='store_true',
+                        help='One-time macOS setup: verify access and save host-scoped camera recovery credentials to Keychain, then exit')
     args = parser.parse_args(argv)
     if args.resume and not args.run_dir:
         parser.error('--resume requires --run-dir')
     if args.replay and (args.demo or args.resume or args.run_dir):
         parser.error('--replay cannot be combined with --demo, --resume, or --run-dir')
+    if args.shadow_mode and (args.resume or args.replay or args.setup_relay_auth):
+        parser.error('--shadow-mode is a startup option for new runs; existing runs retain their checkpoint mode')
     if args.duration is not None and (not np.isfinite(args.duration) or args.duration <= 0):
         parser.error('--duration must be positive and finite')
     existing = owned_run_directory(args.replay or args.run_dir, resume=True) if args.replay or args.resume else None
     config_path = args.config or (existing/'config.json' if existing else ROOT/'config'/'collaborative_two_rovers.json')
     config = load_config(config_path)
+    if args.shadow_mode or (args.demo and not existing and not args.config):
+        # Preserve the review-first synthetic walkthrough without changing a
+        # user's explicit demo profile or the real two-rover default.
+        config['backend']['shadow_mode'] = True
+    if (args.setup_relay_auth or args.prompt_relay_password) and (args.demo or args.replay or args.check):
+        parser.error('Relay credentials apply only to live mode')
+    if args.setup_relay_auth and (args.prompt_relay_password or args.run_dir or args.resume or args.duration or args.port):
+        parser.error('--setup-relay-auth only accepts an optional --config and never starts a coordinator')
+    def relay_access():
+        from collab_relay_auth import MacKeychain, PASSWORD_ENV, prepare
+        # This application never exports a credential. Pass only the relevant
+        # per-source password through the private multiprocessing spawn pipe.
+        return prepare(config['robots'], setup=args.setup_relay_auth, force_prompt=args.prompt_relay_password,
+                       store=MacKeychain() if sys.platform=='darwin' else None,
+                       interactive=sys.stdin.isatty(), session_password=os.environ.pop(PASSWORD_ENV,None))
+    if args.setup_relay_auth:
+        relay_access()
+        return 0
     if existing and args.config:
         saved = load_config(existing/'config.json')
         for section in ('robots', 'perception', 'central_domain', 'input'):
@@ -396,14 +507,17 @@ def main(argv=None):
     check_environment(config, args.demo or bool(args.replay))
     if args.check:
         print(json.dumps({'status':'ready', 'central_domain':config['central_domain'],
-                          'robots':[{k:r[k] for k in ('id','domain','local_frame','depth_registration')} for r in config['robots']],
-                          'dashboard':config['dashboard'], 'mode':'replay' if args.replay else 'demo' if args.demo else 'live'}, indent=2))
+                          'robots':[{k:r[k] for k in ('id','domain','local_frame','base_frame','depth_registration')} for r in config['robots']],
+                          'dashboard':config['dashboard'], 'mode':'replay' if args.replay else 'demo' if args.demo else 'live',
+                          'startup_alignment':'from checkpoint' if existing else
+                              ('shadow' if config['backend']['shadow_mode'] else 'automatic')}, indent=2))
         return 0
     run_dir = existing or owned_run_directory(args.run_dir)
     # Prefix keeps this guard separate from old v2 while preventing two fleet
     # owners of the same central-domain namespace, regardless of run directory.
     lock = ROOT/'.runtime'/(f'collaboration_review_{config["dashboard"]["port"]}.lock' if args.replay else f'collaboration_domain_{config["central_domain"]}.lock')
     with PipelineInstance(lock):
+        relay_passwords = relay_access() if not (args.replay or args.demo) else {}
         run_dir.mkdir(parents=True, exist_ok=True)
         config_file = run_dir/'config.json'
         if not config_file.exists():
@@ -415,9 +529,10 @@ def main(argv=None):
             shutdown.set()
         old_handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
         try:
-            app.start(live=not args.demo and not args.replay)
+            app.start(live=not args.demo and not args.replay, relay_passwords=relay_passwords)
+            relay_passwords.clear()  # individual adapters now own only their session credential
             mode = ('RECORDED REPLAY (source read-only)' if args.replay else 'SYNTHETIC DEMO (no robots)' if args.demo
-                    else f'LIVE; automatic alignment {"SHADOW" if config["backend"].get("shadow_mode", True) else "ENABLED"}')
+                    else f'LIVE; automatic alignment {"SHADOW" if app.backend.config["shadow_mode"] else "ENABLED"}')
             print(f'CrossMaps collaborative: {app.dashboard.url}\nRun: {run_dir}\n'
                   f'Mode: {mode}\n'
                   'Ctrl-C stops only this server and its input adapters.', flush=True)

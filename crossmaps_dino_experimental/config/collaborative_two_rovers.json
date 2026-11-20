@@ -2,7 +2,7 @@
   "central_domain": 42,
   "dashboard": {"host": "127.0.0.1", "port": 8766},
   "input": {"max_hz": 2.0, "max_age_s": 2.0, "sync_slop_s": 0.08},
-  "backend": {"shadow_mode": true},
+  "backend": {"shadow_mode": false, "provisional_enabled": true},
   "pose_guard": {"enabled": true},
   "perception": {
     "parameters": {
@@ -16,6 +16,7 @@
   "robots": [
     {
       "id": "rover_a", "domain": 0, "local_frame": "odom",
+      "camera_relay": {"mode": "auto", "ssh_host": "jetson@192.168.88.244", "max_hz": 1.5, "image_stride": 4},
       "rgb_topic": "/oak/rgb/image_rect/compressed",
       "depth_topic": "/oak/stereo/image_raw/compressedDepth",
       "camera_info_topic": "/oak/rgb/camera_info",
@@ -24,6 +25,7 @@
     },
     {
       "id": "rover_b", "domain": 1, "local_frame": "odom",
+      "camera_relay": {"mode": "auto", "ssh_host": "jetson@192.168.88.249", "max_hz": 1.5, "image_stride": 4},
       "rgb_topic": "/oak/rgb/image_rect/compressed",
       "depth_topic": "/oak/stereo/image_raw/compressedDepth",
       "camera_info_topic": "/oak/rgb/camera_info",

@@ -36,7 +36,7 @@ class FairLatestScheduler:
             queued = self.pending.get(robot)
             if (packet.get('preview_only') and queued and queued['session_id'] == session
                     and not queued.get('preview_only')
-                    and 0 <= self.clock()-queued['received_monotonic'] <= self.max_age_s):
+                    and 0 <= self._queue_age(queued) <= self.max_age_s):
                 # A pending frame with a measured pose can also produce previews.
                 return False
             self.counters[robot]['offered'] += 1
@@ -44,6 +44,14 @@ class FairLatestScheduler:
                 self.counters[robot]['replaced'] += 1
             self.pending[robot] = packet
             return True
+
+    def _queue_age(self, packet):
+        # Only a pose-complete packet gets a separate dispatch budget.
+        ready = packet.get('pose_ready_monotonic')
+        if (ready is not None and packet.get('integration_allowed') and not packet.get('preview_only')
+                and packet.get('T_local_camera') is not None):
+            return self.clock()-float(ready)
+        return self.clock()-float(packet['received_monotonic'])
 
     def take(self):
         with self.lock:
@@ -53,7 +61,7 @@ class FairLatestScheduler:
                 packet = self.pending.pop(robot, None)
                 if packet is None:
                     continue
-                age = self.clock()-float(packet['received_monotonic'])
+                age = self._queue_age(packet)
                 if not math.isfinite(age) or age < -.1 or age > self.max_age_s:
                     self.counters[robot]['expired'] += 1
                     continue

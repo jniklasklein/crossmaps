@@ -103,4 +103,40 @@ check("alignment summary changes invalidate evidence rendering", () => {
   const state = normalizeSnapshot({ alignment_evidence: { retrieved: 100, checked: 20 } });
   assert.notEqual(evidenceRenderKey(state), evidenceRenderKey({ ...state, alignment_evidence: { retrieved: 101, checked: 20 } }));
 });
+const preview = { source_robot: "B", target_robot: "A", status: "provisional", support_count: 4 };
+const stationary = { ...state, shadow_mode: false, alignment_evidence: { provisional: [preview], verified: 4, active: 0 },
+  submaps: [state.submaps[0], { ...state.submaps[1], alignment_state: "provisional", T_world_submap: I, T_preview_world_submap: T }] };
+check("tentative geometry uses its separate transform and tagged draw range; never changes source or RGB", () => {
+  const cloud = buildCloud(stationary, "combined", "rgb");
+  assert.equal(cloud.previewPoints, 1); assert.equal(cloud.previewShown, 1); assert.equal(cloud.previewAvailable, 1);
+  close(cloud.positions[3], 10); close(cloud.positions[4], 3);
+  assert.deepEqual(cloud.colors, [255, 0, 0, 0, 255, 0]);
+  const local = buildCloud(stationary, "B"); assert.deepEqual(local.positions, [1, 0, 0]); assert.equal(local.previewPoints, 0);
+});
+check("preview display filter and shadow mode both omit tentative geometry, not the anchored source", () => {
+  const hidden = buildCloud(stationary, "combined", "source", 100, false);
+  assert.deepEqual(hidden.positions, [1, 0, 0]); assert.equal(hidden.previewShown, 0); assert.equal(hidden.previewAvailable, 1);
+  const shadow = { ...stationary, shadow_mode: true };
+  assert.deepEqual(buildCloud(shadow).excluded, ["b1"]); assert.equal(alignmentEvidence(shadow).previews.length, 0);
+});
+check("declared preview without transform or withdrawn preview with stale transform cannot be projected", () => {
+  for (const submap of [{ ...stationary.submaps[1], T_preview_world_submap: null }, { ...stationary.submaps[1], alignment_state: "unaligned" }]) {
+    const cloud = buildCloud({ ...stationary, submaps: [submap] });
+    assert.deepEqual(cloud.positions, []); assert.deepEqual(cloud.excluded, ["b1"]);
+  }
+});
+check("on promotion, confirmed geometry replaces rather than duplicates or offsets the preview", () => {
+  const promoted = { ...stationary, submaps: [state.submaps[0], { ...stationary.submaps[1], aligned: true, T_world_submap: I }],
+    alignment_evidence: { active: 1, verified: 4, provisional: [] } };
+  assert.deepEqual(buildCloud(promoted).positions, [1, 0, 0, 1, 0, 0]); assert.equal(buildCloud(promoted).previewPoints, 0);
+  assert.equal(alignmentEvidence(promoted).title, "Cross-rover alignment active");
+});
+check("provisional evidence distinguishes preview from confirmation, promotion from replay, and missing from conflicting support", () => {
+  const summary = alignmentEvidence(stationary); assert.match(summary.title, /Provisional/); assert.equal(summary.active, 0);
+  assert.equal(summary.previews[0].support_count, 4); assert.match(summary.next, /cannot link objects/);
+  assert.match(alignmentEvidence({ ...stationary, mode: "recorded_replay" }).next, /does not collect new views/);
+  const held = { ...stationary, alignment_evidence: { provisional: [], provisional_diagnostics: [
+    { status: "withheld", reason: "Two competing placements." }, { status: "waiting", reason: "Only one qualified pair." }] } };
+  assert.deepEqual(alignmentEvidence(held).diagnostics.map(item => item.status), ["withheld", "waiting"]);
+});
 console.log(`${checks} collaborative dashboard checks passed`);

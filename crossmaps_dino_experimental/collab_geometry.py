@@ -5,6 +5,7 @@ The registration functions return evidence, never a decision to merge identities
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import cv2
 import numpy as np
@@ -151,7 +152,7 @@ def icp(source, target, initial, distance=.15, iterations=12):
                 overlap_target=float((reverse < distance).mean()) if len(reverse) else 0.,
                 rmse=max(float(np.sqrt(np.mean(d[d < distance]**2))) if (d < distance).any() else 1e6
                          for d in (forward, reverse)), inliers=int(keep.sum()),
-                icp_source_samples=len(source), icp_target_samples=len(target))
+                reverse_inliers=int((reverse < distance).sum()), icp_source_samples=len(source), icp_target_samples=len(target))
 
 
 def _backproject_pixels(keypoints, depth, intrinsic):
@@ -265,7 +266,7 @@ def _seed_from_matches(source, target, pixels_a, pixels_b, meta, min_inliers):
     return dict(rejected, seed_method='depth_ransac'), fit
 
 
-def _verify_seed(source, target, rejected, fit, min_overlap, max_rmse, pixels=None, min_inliers=12):
+def _verify_seed(source, target, rejected, fit, min_overlap, max_rmse, pixels, hold, min_inliers=12, refine_pixels=True):
     """A visual proposal is never sufficient: all seeds face the same dense checks."""
     # Always measure the original calibrated depth, not a keyframe's decimated
     # visualization points. Bound preprocessing independently of camera size.
@@ -275,11 +276,11 @@ def _verify_seed(source, target, rejected, fit, min_overlap, max_rmse, pixels=No
         return xyz
     cloud_a, cloud_b = cloud(source), cloud(target)
     seed_indices = fit.pop('_seed_indices', None)
+    from collab_pnp import audit_reprojection, prepare_reprojection, refine_reprojection
+    seed = fit['T_target_source']
+    data = prepare_reprojection(source, target, *pixels, seed, min_inliers, seed_indices=seed_indices, hold_indices=hold)
     checked_pose = None
-    if pixels is not None:
-        from collab_pnp import prepare_reprojection, refine_reprojection
-        seed = fit['T_target_source']
-        data = prepare_reprojection(source, target, *pixels, seed, min_inliers, seed_indices=seed_indices)
+    if refine_pixels:
         audit = refine_reprojection(data, seed)
         rejected.update({k: v for k, v in audit.items() if k.startswith('reprojection_')})
         rejected.update(verification_stage='pixel_reprojection')
@@ -288,6 +289,8 @@ def _verify_seed(source, target, rejected, fit, min_overlap, max_rmse, pixels=No
         checked_pose = audit['T_target_source']
         fit['T_target_source'] = checked_pose
     refined = icp(cloud_a, cloud_b, fit['T_target_source'])
+    if 'reverse_inliers' in refined:
+        rejected['icp_reverse_inliers'] = refined['reverse_inliers']
     shift, rotation = pose_delta(fit['T_target_source'], refined['T_target_source'])
     rejected.update(icp_inliers=refined['inliers'], icp_rmse=refined['rmse'],
                     icp_translation_delta_m=shift, icp_rotation_delta_deg=math.degrees(rotation),
@@ -333,6 +336,12 @@ def _verify_seed(source, target, rejected, fit, min_overlap, max_rmse, pixels=No
         return dict(rejected, reason="insufficient_mutually_observed_depth")
     if refined['free_space_conflict'] > .18:
         return dict(rejected, reason="mutually_observed_free_space_conflict")
+    # The ORB fast path skips iterative pixel refinement, but its final ICP
+    # transform must also explain the reserved, spatially distributed pixels.
+    audit = audit_reprojection(data, refined['T_target_source'])
+    rejected.update({k:v for k,v in audit.items() if k.startswith('reprojection_')})
+    if not audit['ok']:
+        return dict(rejected, reason=audit['reason'], verification_stage='pixel_reprojection')
     fit.pop('inlier_mask', None)
     fit.update(refined)
     fit.update(rejected)
@@ -352,7 +361,7 @@ def _stage_rank(result):
             result.get('depth_correspondences', 0), result.get('visual_matches', 0))
 
 
-def verify_rgbd(source, target, min_inliers=12, min_overlap=.25, max_rmse=.065, *, matcher_mode='auto'):
+def _verify_ordered(source, target, min_inliers, min_overlap, max_rmse, matcher_mode):
     """Try inexpensive ORB first. Expand visual proposals, not acceptance tolerances.
 
     If an established seed contradicts dense geometry, reject that pair; do
@@ -362,23 +371,29 @@ def verify_rgbd(source, target, min_inliers=12, min_overlap=.25, max_rmse=.065, 
     if matcher_mode not in ('auto', 'orb'):
         raise ValueError("matcher_mode must be 'auto' or 'orb'")
     from collab_visual_matches import visual_matches
+    from collab_pnp import reprojection_partition
     attempts = []
     for proposals in ([_orb_matches] if matcher_mode == 'orb' else [_orb_matches, visual_matches]):
         a, b, meta = proposals(source, target)
-        evidence, seed = _seed_from_matches(source, target, a, b, meta, min_inliers)
+        train, hold = reprojection_partition(source, target, a, b)
+        evidence, seed = _seed_from_matches(source, target, a[train], b[train], meta, min_inliers)
+        if seed is not None:
+            seed['_seed_indices'] = train[seed['_seed_indices']]
+        evidence.update(visual_matches=len(a), fit_matches=len(train), holdout_matches=len(hold))
         if seed is None and proposals is visual_matches and min(
                 evidence.get('source_matches_with_depth', 0), evidence.get('target_matches_with_depth', 0)) >= min_inliers:
             from collab_pnp import bidirectional_pnp_seed
-            pnp = bidirectional_pnp_seed(source, target, a, b, min_inliers=min_inliers)
+            pnp = bidirectional_pnp_seed(source, target, a[train], b[train], min_inliers=min_inliers)
             evidence['pnp_reason'] = pnp['reason']
             evidence.update({k: v for k, v in pnp.items() if k.startswith('pnp_')})
             if pnp['ok']:
                 seed = dict(pnp)
+                seed['_seed_indices'] = train
                 evidence.update(seed_method='bidirectional_pnp', inliers=pnp['inliers'],
                                 visual_inliers=pnp['visual_inliers'], image_cells=pnp['image_cells'])
         if seed is not None:
             result = _verify_seed(source, target, evidence, seed, min_overlap, max_rmse,
-                                  (a, b) if proposals is visual_matches else None, min_inliers)
+                                  (a, b), hold, min_inliers, refine_pixels=proposals is visual_matches)
             attempts.append(result)
             break
         attempts.append(evidence)
@@ -388,6 +403,60 @@ def verify_rgbd(source, target, min_inliers=12, min_overlap=.25, max_rmse=.065, 
               'ransac_inliers', 'pnp_reason', 'visual_inliers', 'seed_method')
     result['attempts'] = [{k: r[k] for k in fields if k in r} for r in attempts]
     return result
+
+
+def _capture_key(frame):
+    return tuple(str(frame.get(k, '')) for k in ('robot_id','source_id','id','session_id','stamp_ns'))
+
+
+def _measured_key(frame):
+    # Only for low-level anonymous frames / tied metadata. Never use object
+    # address, wall-clock time, or a favourable verification outcome as a key.
+    digest = hashlib.blake2b(digest_size=20)
+    for field in ('rgb','depth','K'):
+        x = np.ascontiguousarray(frame[field])
+        digest.update(repr((x.shape,x.dtype.str)).encode())
+        digest.update(memoryview(x).cast('B'))
+    return digest.digest()
+
+
+def _reverse_evidence(result):
+    result = dict(result)
+    for k in ('T_target_source','T_ransac_target_source','T_icp_target_source'):
+        if k in result:
+            result[k] = np.linalg.inv(result[k])
+    for a, b in (('source_features','target_features'),('source_matches_with_depth','target_matches_with_depth'),
+                 ('image_cells','target_image_cells'),('overlap_source','overlap_target'),
+                 ('icp_source_samples','icp_target_samples'),('icp_inliers','icp_reverse_inliers'),
+                 ('pnp_source_depth','pnp_target_depth'),('pnp_forward_inliers','pnp_reverse_inliers'),
+                 ('pnp_forward_fit_inliers','pnp_reverse_fit_inliers'),
+                 ('reprojection_median_px_forward','reprojection_median_px_reverse'),
+                 ('reprojection_forward_inliers','reprojection_reverse_inliers'),
+                 ('reprojection_holdout_forward_inliers','reprojection_holdout_reverse_inliers')):
+        if a in result and b in result:
+            result[a],result[b] = result[b],result[a]
+    if 'reverse_inliers' in result and 'icp_reverse_inliers' in result:
+        result['reverse_inliers'] = result['icp_reverse_inliers']
+    for k in ('free_space_samples','reprojection_image_cells','reprojection_holdout_cells'):
+        if k in result: result[k] = result[k][::-1]
+    return result
+
+
+def verify_rgbd(source, target, min_inliers=12, min_overlap=.25, max_rmse=.065, *, matcher_mode='auto'):
+    """One fit per unordered pair, always returned in caller source→target coordinates."""
+    a, b = _capture_key(source), _capture_key(target)
+    if a == b:
+        a, b = _measured_key(source), _measured_key(target)
+    reverse = b < a
+    first, second = (target, source) if reverse else (source, target)
+    result = _verify_ordered(first, second, min_inliers, min_overlap, max_rmse, matcher_mode)
+    if result.get('ok'):
+        # Graph currently consumes two isotropic scales, not a 6×6 covariance.
+        # Include the rotation lever arm in the common translation uncertainty
+        # envelope; neither publisher order should make a long baseline cheaper.
+        result['translation_sigma'] = math.hypot(result['translation_sigma'],
+            result['rotation_sigma'] * np.linalg.norm(result['T_target_source'][:3, 3]))
+    return _reverse_evidence(result) if reverse else result
 
 
 def geometry_descriptor(points):

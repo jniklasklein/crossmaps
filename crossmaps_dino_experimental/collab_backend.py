@@ -19,9 +19,19 @@ import numpy as np
 
 from collab_geometry import (depth_points, geometry_descriptor, nearest, optimize_pose_graph,
                              pose_delta, transform, valid_transform, verify_rgbd, voxel_sample)
+from collab_identity_inspector import inspect_link, render_witness
+from collab_provisional import derive_previews, quality_summary
+from collab_retrieval import VerificationSchedule, pair_key
 
 
-DEFAULTS = dict(shadow_mode=True, keyframe_seconds=8., keyframe_translation=.15,
+# Display history, not graph constraints or an odometry product. Keep at most
+# this many sources of path vertices per session (including the live endpoint).
+TRAIL_POINTS = 384
+TRAIL_STEP_M = .04
+TRAIL_GAP_NS = 10_000_000_000
+
+
+DEFAULTS = dict(shadow_mode=True, provisional_enabled=True, keyframe_seconds=8., keyframe_translation=.15,
                 keyframe_rotation_deg=8., submap_translation=1., submap_rotation_deg=20.,
                 submap_seconds=90., submap_keyframes=10, max_keyframes=256, max_submaps=64,
                 max_store_bytes=2*1024**3, keyframe_points=2400, submap_points=5000,
@@ -70,8 +80,9 @@ def validate_config(config):
     if unknown:
         raise ValueError(f"Unknown collaborative backend options: {', '.join(sorted(unknown))}")
     values = dict(DEFAULTS, **config)
-    if type(values['shadow_mode']) is not bool:
-        raise ValueError('shadow_mode must be a JSON boolean')
+    for key in ('shadow_mode', 'provisional_enabled'):
+        if type(values[key]) is not bool:
+            raise ValueError(f'{key} must be a JSON boolean')
     integers = dict(submap_keyframes=(1, 64), max_keyframes=(1, 512), max_submaps=(1, 256),
                     max_store_bytes=(1024, 64*1024**3), keyframe_points=(12, 10000),
                     submap_points=(12, 20000), snapshot_points=(32, 100000), candidate_top_k=(1, 10),
@@ -111,6 +122,7 @@ class Backend:
         self.submaps = {}
         self.constraints = {}
         self.candidates = {}
+        self.verification_schedule = VerificationSchedule()
         self.entity_links = {}
         self.entity_exclusions = set()
         self.entity_registry = {}
@@ -122,6 +134,8 @@ class Backend:
         self.store_bytes = 0
         self.capacity_reason = None
         self._entity_cache = []
+        self._preview_cache = ([], {})
+        self._preview_key = None
         if self.store_dir:
             self.store_dir.mkdir(parents=True, exist_ok=True)
             self._restore()
@@ -131,6 +145,77 @@ class Backend:
 
     def _session(self, robot, session):
         return identifier('source', robot, session)
+
+    def mark_trajectory_gap(self, robot_id, session_id):
+        """Called under the backend lock when pose validation/TF drops.
+
+        Keep the last accepted marker; do not create a session or a pose from a
+        preview. A transition changes revision once, not on every rejected image.
+        """
+        source = self.sessions.get(self._session(robot_id, session_id))
+        trail = source.get('trail') if source else None
+        if not trail or not trail['latest'] or trail['tracking_lost']:
+            return False
+        trail['tracking_lost'] = True
+        self.revision += 1
+        return True
+
+    def _record_trajectory_pose(self, source, obs, anchor, *, disconnected=False):
+        """Keep accepted body poses relative to measured *keyframes*, not world.
+
+        An internal keyframe can move relative to its own submap during a graph
+        solve. Store the offset to that keyframe even for non-keyframe updates.
+        """
+        trail = source.setdefault('trail', dict(points=[], latest=None, tracking_lost=False))
+        mount = obs.get('T_camera_base')
+        frame = 'camera_optical' if mount is None else 'base'
+        local_pose = obs['T_local_camera'] if mount is None else obs['T_local_camera'] @ mount
+        relative = np.linalg.inv(anchor['T_local_camera']) @ local_pose
+        last = trail['latest']
+        split = (disconnected or trail['tracking_lost'] or last is None or frame != last['frame']
+                 or obs['stamp_ns'] - last['stamp_ns'] > TRAIL_GAP_NS)
+        points = trail['points']
+        # Do not consume the path budget idling in place. Latest heading/position
+        # still updates on *every* accepted observation, including a turn in place.
+        store = split or not points
+        if not store:
+            previous = points[-1]
+            other = self.keyframes[previous['anchor']]
+            old_p = other['T_local_camera'][:3, :3] @ previous['p'] + other['T_local_camera'][:3, 3]
+            store = (other['submap_id'] != anchor['submap_id'] or
+                     np.linalg.norm(local_pose[:3, 3] - old_p) >= TRAIL_STEP_M)
+        if store:
+            points.append(dict(anchor=anchor['id'], seq=obs['seq'], p=relative[:3, 3].tolist(),
+                               split=split, frame=frame))
+            if len(points) >= TRAIL_POINTS:  # reserve one transient live endpoint
+                del points[:len(points) - TRAIL_POINTS + 1]
+        trail.update(latest=dict(anchor=anchor['id'], seq=obs['seq'], stamp_ns=obs['stamp_ns'],
+                                 relative=relative.tolist(), frame=frame), tracking_lost=False)
+
+    def _trajectory_snapshot(self, source):
+        trail = source.get('trail')
+        if not trail or not trail['latest']:
+            return dict(latest=None, segments=[], tracking_lost=False)
+        latest = trail['latest']
+        owner = self.keyframes[latest['anchor']]
+        measured = owner['T_submap_camera'] @ latest['relative']
+        tip = dict(submap_id=owner['submap_id'], seq=latest['seq'], stamp_ns=latest['stamp_ns'],
+                   frame=latest['frame'], T_submap_pose=measured)
+        points = trail['points']
+        if not points or points[-1]['seq'] != latest['seq']:
+            points = [*points, dict(anchor=latest['anchor'], p=np.asarray(latest['relative'])[:3, 3],
+                                    frame=latest['frame'], split=False)]
+        segments = []
+        for vertex in points:
+            anchor = self.keyframes[vertex['anchor']]
+            T, sid = anchor['T_submap_camera'], anchor['submap_id']
+            p = np.round(T[:3, :3] @ vertex['p'] + T[:3, 3], 4).tolist()
+            if not segments or vertex['split'] or sid != segments[-1]['submap_id']:
+                segments.append(dict(submap_id=sid, frame=vertex['frame'],
+                                     break_before=not segments or vertex['split'], points=[]))
+            if not segments[-1]['points'] or p != segments[-1]['points'][-1]:
+                segments[-1]['points'].append(p)
+        return dict(latest=tip, segments=segments, tracking_lost=trail['tracking_lost'])
 
     def _cache_features(self, frame):
         matrix = {}
@@ -150,6 +235,14 @@ class Backend:
         changed = float(np.mean(np.abs(a['_view_thumbnail']-b['_view_thumbnail']))) >= .12
         return moved and changed
 
+    def identity_inspection(self, link_id):
+        """Lazy explanation of a stored identity proposal, not a new decision."""
+        return inspect_link(self, link_id, identifier)
+
+    def identity_evidence_image(self, link_id, member_id, frame_id):
+        """JPEG of measured camera-space support for this link's witness only."""
+        return render_witness(self, link_id, member_id, frame_id, identifier)
+
     def _validated(self, observation):
         result = dict(observation)
         for key in ('robot_id', 'session_id', 'seq', 'stamp_ns', 'T_local_camera', 'K', 'rgb', 'depth'):
@@ -160,6 +253,13 @@ class Backend:
             raise ValueError('Robot and session IDs must not be empty')
         result['seq'], result['stamp_ns'] = int(result['seq']), int(result['stamp_ns'])
         result['T_local_camera'] = valid_transform(result['T_local_camera'])
+        if result.get('T_camera_base') is not None:
+            # Optional display metadata cannot invalidate otherwise sound mapping
+            # evidence. A malformed mount falls back to the labelled optical pose.
+            try:
+                result['T_camera_base'] = valid_transform(result['T_camera_base'])
+            except (TypeError, ValueError, OverflowError):
+                result['T_camera_base'] = None
         result['K'] = np.asarray(result['K'], dtype=float)
         result['rgb'] = np.asarray(result['rgb'], dtype=np.uint8)
         result['depth'] = np.asarray(result['depth'], dtype=np.float32)
@@ -210,6 +310,7 @@ class Backend:
         if not obs.get('integration_allowed', True):
             source['status'] = 'pose_inconsistent'
             source['rejected_poses'] += 1
+            self.mark_trajectory_gap(robot, session)
             self._event('pose_rejected', f'{robot}: observation excluded from mapping', pose_quality=source['pose_quality'])
             self.revision += 1
             return self.snapshot()
@@ -220,11 +321,13 @@ class Backend:
             elapsed = (obs['stamp_ns']-last['stamp_ns'])/1e9
             same_calibration = last['calibration_id'] == obs['calibration_id']
             if same_calibration and elapsed < self.config['keyframe_seconds'] and distance < self.config['keyframe_translation'] and angle < math.radians(self.config['keyframe_rotation_deg']):
+                self._record_trajectory_pose(source, obs, last)
                 self.revision += 1
                 return self.snapshot()
         if len(self.keyframes) >= self.config['max_keyframes'] or self.store_bytes >= self.config['max_store_bytes']:
             self.capacity_reason = 'Retained evidence capacity reached; increase limits or start a new run. Existing evidence preserved.'
             source['status'] = 'capacity_reached'
+            self.mark_trajectory_gap(robot, session)
             return self.snapshot()
         submap = self.submaps.get(source['submap_ids'][-1]) if source['submap_ids'] else None
         new_submap = submap is None
@@ -238,6 +341,7 @@ class Backend:
             if len(self.submaps) >= self.config['max_submaps']:
                 self.capacity_reason = 'Submap capacity reached; existing graph preserved. Start a new run or increase max_submaps.'
                 source['status'] = 'capacity_reached'
+                self.mark_trajectory_gap(robot, session)
                 return self.snapshot()
             previous = submap
             submap_id = identifier('submap', robot, session, len(source['submap_ids']))
@@ -264,6 +368,7 @@ class Backend:
         self.keyframes[obs['id']] = obs
         source['keyframe_ids'].append(obs['id'])
         submap['keyframe_ids'].append(obs['id'])
+        self._record_trajectory_pose(source, obs, obs)
         self._rebuild_submap(submap)
         self._retrieve(obs)
         self._apply_pending_anchors()
@@ -300,11 +405,16 @@ class Backend:
         return scores
 
     def _retrieve(self, observation):
+        schedule = self.verification_schedule
+        current = set(self.robots.values())
+        if observation['source_id'] not in current:
+            return
         pool = []
         for target in self.keyframes.values():
-            if target['robot_id'] == observation['robot_id'] or target['feature_space_id'] != observation['feature_space_id']:
+            if (target['robot_id'] == observation['robot_id'] or target['source_id'] not in current
+                    or target['feature_space_id'] != observation['feature_space_id']
+                    or pair_key(target['id'], observation['id']) in schedule.checked):
                 continue
-            # Old sessions remain evidence, but cannot silently inherit new local identities.
             scores = self._scores(observation, target)
             if scores:
                 pool.append((target, scores))
@@ -313,15 +423,23 @@ class Backend:
             ranked = sorted((item for item in pool if cue in item[1]), key=lambda item: (-item[1][cue], item[0]['id']))
             for target, scores in ranked[:self.config['candidate_top_k']]:
                 selected[target['id']] = (target, scores)
-        ranked = sorted(selected.values(), key=lambda item: (-max(item[1].values()), item[0]['id']))
-        # Retain the strongest retrieval slot. With a second slot, also test
-        # a recent view from the other *current* adapter session. A near-1 CLIP
-        # score for a bin used to monopolize both slots with old, nearly
-        # identical target frames. Coordinator receipt time is a cheap proposal
-        # only: not cross-robot clock sync, pose evidence, or corroboration.
+        priority = lambda item: (-schedule.live_priority(observation, *item), item[0]['id'])
+        diversified = sorted(pool, key=priority)
+        for target, cues in diversified[:self.config['candidate_top_k']]:
+            selected[target['id']] = (target, cues)
+        # Also nominate one plausible frame from under-checked submaps outside
+        # the top per-cue lists. Re-ranking a collapsed shortlist is not enough.
+        cells = set()
+        for target, cues in sorted(diversified, key=lambda item: schedule.cell_checks[
+                pair_key(observation['submap_id'], item[0]['submap_id'])]):
+            if target['submap_id'] not in cells:
+                selected[target['id']] = (target, cues)
+                cells.add(target['submap_id'])
+                if len(cells) >= self.config['candidate_top_k']:
+                    break
         received = observation.get('received_monotonic')
         recent_id = None
-        if len(ranked) and self.config['verifications_per_keyframe'] >= 2 and received is not None:
+        if selected and received is not None:
             recent = [(target, cues) for target, cues in pool
                       if self.robots.get(target['robot_id']) == target['source_id']
                       and target.get('received_monotonic') is not None
@@ -329,41 +447,126 @@ class Backend:
             if recent:
                 latest = min(recent, key=lambda pair: (abs(pair[0]['received_monotonic']-received), pair[0]['id']))
                 recent_id = latest[0]['id']
-                if recent_id != ranked[0][0]['id']:
-                    ranked = [ranked[0], latest, *(item for item in ranked[1:] if item[0]['id'] != recent_id)]
-        for index, (target, scores) in enumerate(ranked):
-            candidate_id = identifier('candidate', observation['id'], target['id'])
-            candidate = dict(id=candidate_id, source=observation['id'], target=target['id'],
-                             source_robot=observation['robot_id'], target_robot=target['robot_id'],
-                             source_submap=observation['submap_id'], target_submap=target['submap_id'],
-                             state='proposed', score=max(scores.values()), cues=scores, reason='retrieved_not_verified',
-                             proposal_basis='recent_local_receipt_and_retrieval' if recent_id == target['id'] else 'retrieval')
-            self.candidates[candidate_id] = candidate
-            if index >= self.config['verifications_per_keyframe']:
-                continue
-            verification = verify_rgbd(observation, target, min_inliers=self.config['min_visual_inliers'],
-                                      min_overlap=self.config['min_overlap'], max_rmse=self.config['max_registration_rmse'])
-            candidate['verification'] = plain(verification)
-            candidate['reason'] = verification['reason']
-            if not verification['ok']:
-                candidate['state'] = 'rejected'
-                continue
-            a, b = self.submaps[observation['submap_id']], self.submaps[target['submap_id']]
-            measurement = np.linalg.inv(b['T_local_submap']) @ target['T_local_camera'] @ verification['T_target_source'] @ np.linalg.inv(observation['T_local_camera']) @ a['T_local_submap']
-            local_relation = target['T_local_camera'] @ verification['T_target_source'] @ np.linalg.inv(observation['T_local_camera'])
-            edge = dict(id=candidate_id, source=a['id'], target=b['id'], source_frame=observation['id'], target_frame=target['id'],
-                        T_target_source=measurement, T_targetlocal_sourcelocal=local_relation,
-                        T_targetcamera_sourcecamera=verification['T_target_source'].copy(),
-                        kind='loop', state='verified', active=False, corroborations=1,
-                        translation_sigma=verification['translation_sigma'], rotation_sigma=verification['rotation_sigma'],
-                        provenance='rgbd_'+verification.get('seed_method', 'depth_ransac'),
-                        matcher=verification.get('matcher'), source_session=observation['source_id'], target_session=target['source_id'])
-            self.constraints[candidate_id] = edge
-            candidate.update(state='verified', constraint_id=candidate_id)
-            self._corroborate(edge)
+                selected[recent_id] = latest
+        ranked = sorted(selected.values(), key=priority)
+        live = []
+        for target, scores in ranked:
+            candidate = self._proposal(observation, target, scores,
+                    'recent_local_receipt_and_retrieval' if recent_id == target['id'] else 'retrieval')
+            self.candidates[candidate['id']] = candidate
+            live.append(candidate)
+        budget = self.config['verifications_per_keyframe']
+        if live and budget:
+            schedule.turn += 1
+            # First try a strong but not repeatedly exhausted target. When
+            # available, the second slot usually goes to a contemporaneous view.
+            # Every third round reserve one slot for an older *unchecked* pair
+            # (every fourth with budget=1); no extra full verifier calls.
+            older = None
+            if schedule.turn % (4 if budget == 1 else 3) == 0 or (budget >= 2 and recent_id is None):
+                older = self._next_backfill(current, exclude_frame=observation['id'])
+            nearest = next((c for c in live[1:] if c['target'] == recent_id), None)
+            jobs = ([older] if budget == 1 and older is not None else
+                    [live[0]] + [c for c in (older, nearest) if c is not None] + live[1:])
+            used = 0
+            for c in jobs:
+                if self._check_candidate(c, 'historical_backfill' if c is older else
+                                         'recent_capture' if c['target'] == recent_id else 'diverse_retrieval'):
+                    used += 1
+                if used >= budget:
+                    break
+        for c in live:
+            if 'verification' not in c and budget:
+                schedule.add(c)
         # Diagnostics are bounded; accepted constraints retain their complete evidence IDs.
         while len(self.candidates) > 300:
             self.candidates.pop(next(iter(self.candidates)))
+
+    def _proposal(self, source, target, scores, basis):
+        # Keep a retained review card's original orientation/ID when the
+        # exploration lane rediscovers it from the opposite direction.
+        for left, right in ((source, target), (target, source)):
+            previous = self.candidates.get(identifier('candidate', left['id'], right['id']))
+            if previous is not None:
+                return previous
+        times = [f.get('received_monotonic') for f in (source, target)]
+        return dict(id=identifier('candidate', source['id'], target['id']), source=source['id'], target=target['id'],
+                    source_robot=source['robot_id'], target_robot=target['robot_id'],
+                    source_submap=source['submap_id'], target_submap=target['submap_id'],
+                    state='proposed', score=max(scores.values()), cues=scores, reason='retrieved_not_verified',
+                    receipt_gap_s=None if None in times else abs(times[0]-times[1]), proposal_basis=basis)
+
+    def _next_backfill(self, current, exclude_frame=None):
+        schedule = self.verification_schedule
+        deferred = schedule.historical(self.keyframes, current, exclude_frame=exclude_frame)
+        if deferred is not None and schedule.backfilled % 4 != 3:
+            return deferred
+        # A bounded review list alone can never nominate a pair that all
+        # semantic top lists skipped. Periodically search outside those lists.
+        sources = [self.sessions[sid] for sid in sorted(current)]
+        for a, b in schedule.explore(sources, self.keyframes, exclude_frame=exclude_frame):
+            cues = self._scores(a, b)
+            if cues:
+                return self._proposal(a, b, cues, 'retained_trajectory_exploration')
+        return deferred
+
+    def _check_candidate(self, candidate, basis):
+        schedule = self.verification_schedule
+        candidate_id = candidate['id']
+        observation, target = (self.keyframes[candidate[k]] for k in ('source', 'target'))
+        if (pair_key(observation['id'], target['id']) in schedule.checked
+                or observation['source_id'] != self.robots.get(observation['robot_id'])
+                or target['source_id'] != self.robots.get(target['robot_id'])
+                or observation['robot_id'] == target['robot_id']
+                or observation['feature_space_id'] != target['feature_space_id']):
+            return False
+        verification = verify_rgbd(observation, target, min_inliers=self.config['min_visual_inliers'],
+                                   min_overlap=self.config['min_overlap'], max_rmse=self.config['max_registration_rmse'])
+        schedule.mark(observation, target)
+        if basis == 'historical_backfill':
+            schedule.backfilled += 1
+        candidate.update(verification=plain(verification), verification_basis=basis, reason=verification['reason'])
+        # Bring an older item back to the review window with its original ID.
+        self.candidates.pop(candidate_id, None)
+        self.candidates[candidate_id] = candidate
+        if not verification['ok']:
+            candidate['state'] = 'rejected'
+            return True
+        a, b = self.submaps[observation['submap_id']], self.submaps[target['submap_id']]
+        measurement = np.linalg.inv(b['T_local_submap']) @ target['T_local_camera'] @ verification['T_target_source'] @ np.linalg.inv(observation['T_local_camera']) @ a['T_local_submap']
+        local_relation = target['T_local_camera'] @ verification['T_target_source'] @ np.linalg.inv(observation['T_local_camera'])
+        edge = dict(id=candidate_id, source=a['id'], target=b['id'], source_frame=observation['id'], target_frame=target['id'],
+                    T_target_source=measurement, T_targetlocal_sourcelocal=local_relation,
+                    T_targetcamera_sourcecamera=verification['T_target_source'].copy(),
+                    kind='loop', state='verified', active=False, corroborations=1,
+                    translation_sigma=verification['translation_sigma'], rotation_sigma=verification['rotation_sigma'],
+                    verification_quality=quality_summary(verification),
+                    provenance='rgbd_'+verification.get('seed_method', 'depth_ransac'),
+                    matcher=verification.get('matcher'), source_session=observation['source_id'], target_session=target['source_id'])
+        self.constraints[candidate_id] = edge
+        candidate.update(state='verified', constraint_id=candidate_id)
+        self._corroborate(edge)
+        return True
+
+    def backfill_one(self):
+        """Spend at most one verifier call on current-session deferred evidence.
+
+        The live owner may call this on its rate-limited idle path. Snapshots,
+        ordinary replay reads and operator commands never run it implicitly.
+        """
+        if not self.config['verifications_per_keyframe']:
+            return False
+        c = self._next_backfill(set(self.robots.values()))
+        if c is None or not self._check_candidate(c, 'historical_backfill'):
+            return False
+        if c['verification']['ok']:
+            self._optimize()
+            self._update_entities()
+        while len(self.candidates) > 300:
+            self.candidates.pop(next(iter(self.candidates)))
+        self.revision += 1
+        self._persist_state()
+        return True
 
     def _corroborate(self, edge):
         first = self.keyframes[edge['source_frame']]
@@ -424,6 +627,7 @@ class Backend:
         return True
 
     def _optimize(self):
+        self._preview_key = None  # Graph changes, including reject/undo, can leave edge count unchanged.
         reference = self.sessions.get(self.reference_session, {})
         roots = reference.get('keyframe_ids', [])
         if not roots:
@@ -683,6 +887,14 @@ class Backend:
         return result
 
     def snapshot(self):
+        # Do not run registration on HTTP polls. Only presentation uses these
+        # separate poses; solver/identities/persistence still see confirmed data.
+        key = (len(self.keyframes), len(self.constraints), tuple(self.robots.values()),
+               self.config['shadow_mode'], self.config['provisional_enabled'])
+        if self._preview_key != key:
+            self._preview_cache = derive_previews(self)
+            self._preview_key = key
+        audits, preview = self._preview_cache
         robots = []
         for robot_id, source_id in self.robots.items():
             source = self.sessions[source_id]
@@ -692,8 +904,12 @@ class Backend:
             world_camera = latest['T_world_submap'] @ latest_frame['T_submap_camera'] if latest and latest['aligned'] else None
             robots.append(dict(robot_id=robot_id, session_id=source['session_id'], source_id=source_id,
                 frames=source['frames'], keyframes=len(source['keyframe_ids']), submaps=len(maps), status=source['status'],
-                aligned=bool(latest and latest['aligned']), last_stamp_ns=source['last_stamp_ns'],
+                aligned=bool(latest and latest['aligned']),
+                alignment_state=('confirmed' if latest and latest['aligned'] else
+                                 'provisional' if source_id in preview else 'unaligned'),
+                last_stamp_ns=source['last_stamp_ns'],
                 last_received=source.get('last_received'), pose_quality=source.get('pose_quality'), rejected_poses=source['rejected_poses'],
+                trajectory=self._trajectory_snapshot(source),
                 T_world_camera=world_camera,
                 T_world_local=(world_camera @ np.linalg.inv(latest_frame['T_local_camera'])) if world_camera is not None else None))
         maps = []
@@ -702,6 +918,10 @@ class Backend:
             indices = np.linspace(0, len(submap['points'])-1, min(per_map, len(submap['points']))).astype(int)
             maps.append(dict(id=submap['id'], robot_id=submap['robot_id'], session_id=submap['session_id'],
                 keyframe_count=len(submap['keyframe_ids']), aligned=submap['aligned'],
+                alignment_state=('confirmed' if submap['aligned'] else
+                                 'provisional' if submap['source_id'] in preview else 'unaligned'),
+                T_preview_world_submap=(preview[submap['source_id']] @ submap['T_local_submap']
+                                        if not submap['aligned'] and submap['source_id'] in preview else None),
                 T_world_submap=submap['T_world_submap'], T_local_submap=submap['T_local_submap'],
                 points=submap['points'][indices], colors=submap['colors'][indices]))
         # The review list is paged to 100 items. Count retained candidates for
@@ -716,6 +936,8 @@ class Backend:
         active = sum(e['kind']=='loop' and e['active'] for e in self.constraints.values()
                      if e.get('source_session') in current and e.get('target_session') in current)
         evidence = dict(retrieved=len(candidates), checked=len(checked), verified=sum(v['ok'] for v in checked),
+                        provisional=[r for r in audits if r['status'] == 'provisional'],
+                        provisional_diagnostics=audits,
                         active=active, best_rejection=None if best is None else dict(
                             reason=best['reason'], inliers=best.get('visual_inliers', best.get('inliers', 0)),
                             **{k: best[k] for k in ('visual_matches', 'verification_stage', 'matcher') if k in best}))
@@ -727,9 +949,12 @@ class Backend:
             pending_anchors=self.pending_anchors, events=list(self.events),
             stats=dict(keyframes=len(self.keyframes), submaps=len(self.submaps), sessions=len(self.sessions),
                        store_bytes=self.store_bytes, capacity_reason=self.capacity_reason, graph=self.graph_status,
+                       verification_scheduler=self.verification_schedule.report(),
                        accepted_loops=sum(edge['kind']=='loop' and edge['active'] for edge in self.constraints.values()),
                 entity_links=sum(link.get('active', False) and link.get('alignment_valid', False) and link.get('compatible_current', False) for link in self.entity_links.values())),
             semantics=dict(absence_is_negative_evidence=False, automatic_alignment='shadow' if self.config['shadow_mode'] else 'corroborated_only',
+                           provisional_display_enabled=self.config['provisional_enabled'] and not self.config['shadow_mode'],
+                           provisional_used_for_graph_or_identity=False,
                            local_ids_are_source_owned=True, robot_tf_modified=False, submap_internal_pose_correction=True,
                            geometry_rebuilt_from_original_camera_support=True,
                            T_world_local_is_latest_pose_diagnostic_not_rigid_map_transform=True)))
@@ -740,6 +965,8 @@ class Backend:
         metadata = {key: frame[key] for key in ('id', 'source_id', 'submap_id', 'robot_id', 'session_id',
                     'seq', 'stamp_ns', 'rgb_stamp_ns', 'received_monotonic', 'calibration_id', 'feature_space_id', 'pose_quality') if key in frame}
         arrays = {key: frame[key] for key in ('rgb', 'depth', 'K', 'T_local_camera', 'points_camera', 'colors')}
+        if frame.get('T_camera_base') is not None:
+            arrays['T_camera_base'] = frame['T_camera_base']
         for key in ('global_descriptor', 'geometry_descriptor'):
             arrays[key] = np.asarray(frame[key] if frame[key] is not None else [], dtype=np.float32)
         metadata['surfaces'] = []
@@ -763,6 +990,10 @@ class Backend:
             sessions=self.sessions, robots=self.robots, reference_session=self.reference_session,
             submaps={key: {name: value for name, value in item.items() if name not in ('points', 'colors')} for key, item in self.submaps.items()},
             constraints=self.constraints, candidates=self.candidates, entity_links=self.entity_links,
+            verification_schedule=dict(checked=sorted(self.verification_schedule.checked),
+                                       pending=list(self.verification_schedule.pending.values()),
+                                       turn=self.verification_schedule.turn, backfilled=self.verification_schedule.backfilled,
+                                       cursor=self.verification_schedule.cursor),
             entity_registry=self.entity_registry,
             entity_exclusions=sorted(self.entity_exclusions), pending_anchors=self.pending_anchors,
             events=list(self.events), capacity_reason=self.capacity_reason)
@@ -799,6 +1030,8 @@ class Backend:
                     frame = json.loads(str(arrays['metadata'].item()))
                     for name in ('rgb', 'depth', 'K', 'T_local_camera', 'points_camera', 'colors'):
                         frame[name] = arrays[name].copy()
+                    if 'T_camera_base' in arrays:
+                        frame['T_camera_base'] = valid_transform(arrays['T_camera_base'])
                     for name in ('global_descriptor', 'geometry_descriptor'):
                         frame[name] = arrays[name].copy() if arrays[name].size else None
                     for index, surface in enumerate(frame['surfaces']):
@@ -806,8 +1039,41 @@ class Backend:
                             data = arrays[f's{index}_{name}']
                             surface[name] = data.copy() if data.size else None
                 self.keyframes[key] = frame
+                # A reference session may have no accepted root yet. Even when
+                # the graph can't solve, replay must preserve local trajectories.
+                frame['T_submap_camera'] = (np.linalg.inv(self.submaps[frame['submap_id']]['T_local_submap'])
+                                            @ frame['T_local_camera'])
                 self._cache_features(frame)
                 self.store_bytes += frame_path.stat().st_size
+            if 'trail' not in source:
+                # Old recordings retained only keyframes. Missing sequence
+                # numbers can hide rejected poses, so don't invent connections.
+                previous = None
+                for key in source['keyframe_ids'][-TRAIL_POINTS:]:
+                    frame = self.keyframes[key]
+                    self._record_trajectory_pose(source, frame, frame, disconnected=(
+                        previous is None or frame['seq'] != previous['seq'] + 1))
+                    previous = frame
+                if previous and (source.get('status') != 'observing' or
+                                 source.get('last_seq') != previous['seq']):
+                    source['trail']['tracking_lost'] = True
+        # Legacy recordings didn't persist rejected pairs once their 300-card
+        # review window rolled over. Import every check we *can* prove, and
+        # always honor retained loop/operator decisions even off that window.
+        saved = state.get('verification_schedule', {})
+        checked = [*saved.get('checked', ()),
+                   *((c['source'], c['target']) for c in self.candidates.values() if 'verification' in c),
+                   *((e['source_frame'], e['target_frame']) for e in self.constraints.values() if e['kind'] == 'loop')]
+        schedule = self.verification_schedule
+        for left, right in checked:
+            if left in self.keyframes and right in self.keyframes:
+                schedule.mark(self.keyframes[left], self.keyframes[right])
+        schedule.turn = saved.get('turn', 0)
+        schedule.backfilled = saved.get('backfilled', 0)
+        schedule.cursor = saved.get('cursor', 0)
+        for c in saved.get('pending', self.candidates.values()):
+            if c.get('state') == 'proposed' and 'verification' not in c:
+                schedule.add(c)
         for submap in self.submaps.values():
             self._rebuild_submap(submap)
         self._optimize()

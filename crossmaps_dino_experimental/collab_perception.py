@@ -480,6 +480,12 @@ class PerceptionFleet:
             image = self._images.get((str(robot), VIEW_ALIASES.get(view, view)))
             return image[:2] if image is not None and (session_id is None or image[2] == session_id) else None
 
+    def image_with_receipt(self, robot, view, session_id):
+        """Bytes and input receipt time from the same stored observation."""
+        with self._snapshot_lock:
+            image = self._images.get((str(robot), VIEW_ALIASES.get(view, view)))
+            return (image[0], image[3]) if image is not None and image[2] == session_id else None
+
     def image_metadata(self, robot, session_id=None):
         """Acquisition monotonic times, independent of transient worker health."""
         with self._snapshot_lock:

@@ -11,7 +11,7 @@ DEFAULT_CONFIG = {
     "dashboard": {"host": "127.0.0.1", "port": 8766},
     "input": {
         "max_hz": 2.0, "max_age_s": 2.0, "sync_slop_s": 0.08,
-        "tf_timeout_s": 0.08, "qos_depth": 5, "max_pixels": 2073600,
+        "tf_timeout_s": 0.08, "tf_wait_budget_s": 6.0, "qos_depth": 5, "max_pixels": 2073600,
         "min_depth_m": 0.2, "max_depth_m": 8.0,
     },
     "perception": {"parameters": {
@@ -24,7 +24,7 @@ DEFAULT_CONFIG = {
         "max_rotation_error_deg": 5.0, "max_speed_m_s": 2.0,
         "max_yaw_rate_deg_s": 150.0,
     },
-    "backend": {"shadow_mode": True},
+    "backend": {"shadow_mode": False},
     "robots": [
         {"id": "rover_a", "domain": 0},
         {"id": "rover_b", "domain": 1},
@@ -32,12 +32,15 @@ DEFAULT_CONFIG = {
 }
 ROBOT_DEFAULTS = {
     "local_frame": "odom",
+    "base_frame": "base_footprint",
     "rgb_topic": "/oak/rgb/image_rect/compressed",
     "depth_topic": "/oak/stereo/image_raw/compressedDepth",
     "camera_info_topic": "/oak/rgb/camera_info",
     "depth_camera_info_topic": "/oak/stereo/camera_info",
     "rgb_compressed": True, "depth_compressed": True,
     "depth_registration": "auto", "depth_scale": 0.001,
+    "camera_relay": {"mode": "off", "ssh_host": "", "container": "ugv_jetson_ros_humble",
+                     "max_hz": 1.5, "image_stride": 1},
     "parameters": {},
 }
 
@@ -88,7 +91,7 @@ def validate_config(config):
     if not isinstance(dashboard["port"], int):
         raise ValueError("dashboard.port must be an integer")
     limits = {"max_hz": (.1, 30), "max_age_s": (.1, 30),
-              "sync_slop_s": (.001, .5), "tf_timeout_s": (0, .5),
+              "sync_slop_s": (.001, .5), "tf_timeout_s": (0, .5), "tf_wait_budget_s": (.1, 10.),
               "qos_depth": (1, 30), "max_pixels": (1024, 8294400),
               "min_depth_m": (.01, 5), "max_depth_m": (.1, 100)}
     for name, bounds in limits.items():
@@ -119,9 +122,33 @@ def validate_config(config):
         for field in ("local_frame", "rgb_topic", "depth_topic", "camera_info_topic", "depth_camera_info_topic"):
             if not isinstance(robot[field], str) or not robot[field] or len(robot[field]) > 240:
                 raise ValueError(f"{identifier}.{field} must be a nonempty ROS name")
+        if not isinstance(robot['base_frame'], str) or not re.fullmatch(
+                r'[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)*', robot['base_frame']) or len(robot['base_frame']) > 240:
+            raise ValueError(f"{identifier}.base_frame must be a relative TF frame name")
         for field in ("rgb_compressed", "depth_compressed"):
             if not isinstance(robot[field], bool):
                 raise ValueError(f"{identifier}.{field} must be boolean")
+        relay = robot['camera_relay']
+        if not isinstance(relay, dict) or set(relay) != set(ROBOT_DEFAULTS['camera_relay']):
+            raise ValueError(f'{identifier}.camera_relay has unknown or missing settings; credentials do not belong in config')
+        if relay['mode'] not in ('off', 'auto', 'always'):
+            raise ValueError(f'{identifier}.camera_relay.mode must be off, auto or always')
+        host, container = relay['ssh_host'], relay['container']
+        if not isinstance(host, str) or ((host or relay['mode'] != 'off') and not re.fullmatch(
+                r'(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,31}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,252}', host)):
+            raise ValueError(f'{identifier}.camera_relay.ssh_host must be a hostname or user@hostname')
+        if not isinstance(container, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', container):
+            raise ValueError(f'{identifier}.camera_relay.container must be a Docker container name')
+        _number(relay['max_hz'], f'{identifier}.camera_relay.max_hz', .1, 5.)
+        if type(relay['image_stride']) is not int or not 1 <= relay['image_stride'] <= 4:
+            raise ValueError(f'{identifier}.camera_relay.image_stride must be an integer in [1, 4]')
+        if relay['mode'] != 'off':
+            for key in ('rgb_topic', 'depth_topic', 'camera_info_topic', 'depth_camera_info_topic'):
+                if not re.fullmatch(r'(?:/[A-Za-z_][A-Za-z_0-9]*)+', robot[key]):
+                    raise ValueError(f'{identifier}.{key} must be a fully qualified ROS topic for the relay')
+            if not (robot['rgb_compressed'] and robot['depth_compressed']
+                    and robot['rgb_topic'].endswith('/compressed') and robot['depth_topic'].endswith('/compressedDepth')):
+                raise ValueError(f'{identifier}.camera_relay requires compressed RGB and compressedDepth topics')
         _number(robot["depth_scale"], "depth_scale", .000001, 1.)
         if not isinstance(robot["parameters"], dict):
             raise ValueError("robot parameters must be an object")

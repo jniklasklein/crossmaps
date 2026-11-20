@@ -65,8 +65,30 @@ class ApplicationTests(unittest.TestCase):
         state = self.app.snapshot()['robots'][0]
         self.assertEqual(state['mapping_status'], 'new_session_pending')
         self.assertFalse(state['aligned'])
+        self.assertEqual(state['alignment_state'], 'unaligned')
+        self.assertIsNone(state['T_world_camera'])
         self.assertIsNone(state['T_world_local'])
+        self.assertIsNone(state['trajectory'])
         self.assertIsNone(state['map_observation_age_s'])
+        self.assertIsNone(state['map_update_age_s'])
+
+    def test_session_replacement_hides_even_a_preview_using_that_rover_as_reference(self):
+        self.pair()
+        cached = self.app.cached
+        cached['alignment_evidence']['provisional'] = [dict(source_robot='rover_b', target_robot='rover_a')]
+        cached['alignment_evidence']['provisional_diagnostics'] = cached['alignment_evidence']['provisional']
+        b = next(r for r in cached['robots'] if r['robot_id'] == 'rover_b')
+        sub = next(m for m in cached['submaps'] if m['robot_id'] == 'rover_b')
+        b['alignment_state'] = sub['alignment_state'] = 'provisional'
+        sub['T_preview_world_submap'] = np.eye(4).tolist()
+        self.app.offer(dict(observations(1, self.config['robots'])[0], session_id='new-reference'))
+        snap = self.app.snapshot()
+        self.assertEqual(snap['alignment_evidence']['provisional'], [])
+        self.assertEqual(snap['alignment_evidence']['provisional_diagnostics'], [])
+        self.assertNotIn('provisional', [r['alignment_state'] for r in snap['robots']])
+        self.assertNotIn('provisional', [m['alignment_state'] for m in snap['submaps']])
+        self.assertIsNone(next(m for m in snap['submaps'] if m['robot_id'] == 'rover_b')['T_preview_world_submap'])
+        self.assertEqual(sub['alignment_state'], 'provisional')  # presentation didn't mutate the source
 
     def test_tf_missing_preview_does_not_advance_evidence_or_mapped_time(self):
         self.pair()
@@ -78,11 +100,40 @@ class ApplicationTests(unittest.TestCase):
         self.assertTrue(self.app.process_one())
         new = self.app.snapshot()['robots'][0]
         self.assertEqual(new['status'], 'waiting_for_tf')
+        self.assertTrue(new['trajectory']['tracking_lost'])
+        self.assertEqual(new['trajectory']['latest'], old['trajectory']['latest'])
         self.assertEqual(old['frames'], new['frames'])
         self.assertEqual(self.app.telemetry['rover_a']['last_mapped_monotonic'], mapped)
+        self.assertEqual(old['map_finished_monotonic'], new['map_finished_monotonic'])
         self.app.offer(dict(packet, seq=packet['seq']+1))
         self.assertTrue(self.app.process_one())
         self.assertEqual(self.app.snapshot()['robots'][0]['frames'], old['frames']+1)
+        self.assertFalse(self.app.snapshot()['robots'][0]['trajectory']['tracking_lost'])
+
+    def test_map_completion_age_is_separate_from_input_receipt_age(self):
+        packet = observations(0, self.config['robots'])[0]
+        packet['received_monotonic'] = time.monotonic()-1.
+        self.app.offer(packet)
+        self.assertTrue(self.app.process_one())
+        row = self.app.snapshot()['robots'][0]
+        self.assertGreaterEqual(row['map_observation_age_s'] - row['map_update_age_s'], .99)
+
+    def test_idle_verification_is_bounded_and_never_retimes_a_camera_or_runs_on_replay(self):
+        self.pair()
+        app = self.app
+        app.demo = False
+        app.backend.backfill_one = Mock(return_value=True)
+        original = deepcopy(app.telemetry)
+        app.next_idle_verification = 0.
+        self.assertTrue(app._idle_verification())
+        self.assertEqual(app.telemetry,original)
+        self.assertFalse(app._idle_verification())  # rate limit
+        app.next_idle_verification = 0.; app.replay = True
+        self.assertFalse(app._idle_verification())
+        app.replay = False
+        app.telemetry['rover_a']['session_id'] = 'restarted adapter awaiting pose'
+        self.assertFalse(app._idle_verification())
+        app.backend.backfill_one.assert_called_once_with()
 
     def test_acquisition_feeds_and_recovery_are_independent_of_worker(self):
         reports = queue.Queue()

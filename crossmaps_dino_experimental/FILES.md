@@ -7,13 +7,18 @@ Its complete startup and operating guide is [COLLABORATIVE.md](COLLABORATIVE.md)
 
 | File | Purpose |
 | --- | --- |
+| `collab_relay_auth.py` | Host-scoped SSH/Keychain preflight and optional local enrollment for camera recovery. |
+| `collab_retrieval.py` | Bounded queue and verification coverage across different frame and submap pairs. |
 | `crossmaps_collaborative.py` | One-command coordinator, input process lifecycle, shared inference scheduling, built-in dashboard, checkpoints. |
-| `config/collaborative_two_rovers.json` | Two-rover defaults: input domains 0/1, central domain 42, dashboard port 8766, shadow mode. |
+| `config/collaborative_two_rovers.json` | Two-rover live defaults: input domains 0/1, central domain 42, dashboard port 8766, automatic alignment. |
 | `collab_config.py` | Configuration validation and experimental-owned run directories. |
 | `collab_transport.py` | Read-only per-domain ROS input adapters, isolated TF, compressed RGB-D decoding and calibrated depth registration. |
+| `collab_camera_relay.py` / `collab_camera_relay_source.py` | Optional authenticated, bounded compressed RGB-D fallback for Wi-Fi; laptop receiver and ephemeral sensor-only sampler inside the running rover container. |
 | `collab_runtime.py` | Fair bounded latest-frame scheduling and completed-cycle timing. |
 | `collab_perception.py` | Shared model objects with separate source/session v2 memories; pose contradiction guard and observation evidence extraction. |
 | `collab_backend.py` | Keyframes/submaps, candidate retrieval, source/session provenance, pose constraints, reversible global identity links and persistence. |
+| `collab_provisional.py` | Display-only provisional alignment from agreeing, verified RGB-D captures; confirmed graph and object identities stay separate. |
+| `collab_identity_inspector.py` | Read-only identity review: contributing camera frames, projected surface samples and explanations of pending or suspended links. |
 | `collab_geometry.py` | RGB-D correspondence verification, robust fitting, ICP, geometry checks and bounded sparse keyframe pose-graph optimization. |
 | `collab_dashboard.py` | Loopback HTTP server, protected command API, source camera endpoints and static asset allowlist. |
 | `collab_dashboard/index.html` | Collaborative dashboard layout and alignment controls. |

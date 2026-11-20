@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 from pathlib import Path
 import re
 import secrets
@@ -23,6 +24,8 @@ _STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
 _VIEWS = frozenset(("rgb", "sam", "segments", "entities", "dino", "dino_similarity", "clip", "depth"))
 _COMMANDS = frozenset(("anchor", "clear_anchor", "accept_constraint", "reject_constraint", "set_shadow_mode", "accept_entity_link", "unlink_entities", "save"))
 _ROBOT = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# All three identifiers are opaque store hashes, never filesystem paths.
+_IDENTITY = re.compile(r"/api/identity/([0-9a-f]{20})(?:/([0-9a-f]{20})/([0-9a-f]{20})\.jpg)?")
 
 
 def _loopback(host):
@@ -49,10 +52,12 @@ class CollaborativeDashboard:
     """
 
     def __init__(self, state_provider, command_handler, image_provider=None,
-                 host="127.0.0.1", port=8766):
+                 host="127.0.0.1", port=8766, *, identity_provider=None, witness_provider=None):
         self.state_provider = state_provider
         self.command_handler = command_handler
         self.image_provider = image_provider
+        self.identity_provider = identity_provider
+        self.witness_provider = witness_provider
         self.host, self.port = str(host), int(port)
         self._server = None
         self._thread = None
@@ -92,12 +97,14 @@ class CollaborativeDashboard:
                     return False
                 return hostname in {"localhost", "127.0.0.1", "::1", owner.host}
 
-            def _reply(self, status, payload, content_type="application/json; charset=utf-8"):
+            def _reply(self, status, payload, content_type="application/json; charset=utf-8", *, image_age=None):
                 if not isinstance(payload, bytes):
                     payload = json.dumps(payload, default=_json_default, allow_nan=False).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(payload)))
+                if image_age is not None:
+                    self.send_header("X-CrossMaps-Image-Age-S", f"{image_age:.3f}")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Referrer-Policy", "no-referrer")
@@ -120,6 +127,22 @@ class CollaborativeDashboard:
                         state["_dashboard"] = {"commands_enabled": local,
                                                "command_token": owner._token if local else None}
                         self._reply(200, state)
+                    elif match := _IDENTITY.fullmatch(parsed.path):
+                        link, member, frame = match.groups()
+                        if member is None:
+                            report = owner.identity_provider(link) if owner.identity_provider else None
+                            if report is None:
+                                self._reply(404, {"ok": False, "error": "Identity proposal not found"})
+                            else:
+                                self._reply(200, report)
+                        else:
+                            data = owner.witness_provider(link, member, frame) if owner.witness_provider else None
+                            if data is None:
+                                self._reply(404, {"ok": False, "error": "No measured image for this witness"})
+                            elif not isinstance(data, bytes) or not 0 < len(data) <= 16 * 1024 * 1024:
+                                raise ValueError("Invalid witness image provider result")
+                            else:
+                                self._reply(200, data, "image/jpeg")
                     elif parsed.path == "/api/image":
                         query = parse_qs(parsed.query, max_num_fields=8)
                         robot = query.get("robot", [""])[0]
@@ -131,10 +154,14 @@ class CollaborativeDashboard:
                         if result is None:
                             self._reply(404, {"ok": False, "error": "No image received for this view"})
                             return
-                        data, mime = result
+                        data, mime, *ages = result
+                        age = ages[0] if ages else None
+                        if len(ages) > 1 or (age is not None and
+                                (type(age) not in (int, float) or not math.isfinite(age) or age < 0)):
+                            raise ValueError("Invalid image receipt age")
                         if not isinstance(data, bytes) or len(data) > 16 * 1024 * 1024 or mime not in ("image/jpeg", "image/png", "image/webp"):
                             raise ValueError("Invalid image provider result")
-                        self._reply(200, data, mime)
+                        self._reply(200, data, mime, image_age=age)
                     else:
                         self._reply(404, {"ok": False, "error": "Not found"})
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):

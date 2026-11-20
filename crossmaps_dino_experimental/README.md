@@ -17,9 +17,18 @@ Open **http://127.0.0.1:8766**. The default inputs are rover A/domain 0 and rove
 B/domain 1; the central diagnostic domain is 42. No separate dashboard process is
 needed. Start the rover publishers first; stop old local perception runs so that
 models are not duplicated. `--demo` runs a clearly synthetic no-robot test.
+The normal live command uses SSH keys or host-specific Mac Keychain entries
+for automatic compressed-camera recovery. On a new Mac with password-based
+rovers, run the same command with `--setup-relay-auth` once.
 
-Automatic cross-rover alignment starts in **shadow mode**. Inspect verified
-candidates or supply a measured anchor before interpreting a combined map.
+New live runs start in **automatic alignment mode**. Use `--shadow-mode` to
+start a fresh run in review mode instead. You can see a **provisional**
+combined map when several strong RGB-D matches agree, even
+with both rovers parked. An agreeing match from a changed viewpoint can confirm
+the alignment automatically. Provisional poses are display-only; they do not
+create shared object identities or change robot localization.
+The spatial viewer shows each rover’s last accepted position, forward direction,
+and path. Rovers without alignment are still visible in their own local views.
 Nothing in this experiment changes the robot's localization or fixes upstream
 yaw drift. The code below remains the single-rover foundation, not the launch
 procedure for two rovers.

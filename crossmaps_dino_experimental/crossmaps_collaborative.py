@@ -24,7 +24,7 @@ import cv2
 import numpy as np
 
 from collab_backend import Backend
-from collab_config import ROOT, load_config, owned_run_directory
+from collab_config import CLIP_PRESETS, ROOT, configure_shared_clip, load_config, owned_run_directory
 from collab_dashboard import CollaborativeDashboard
 from collab_runtime import FairLatestScheduler, CycleTiming
 from collab_transport import require_compressed_transport, run_adapter
@@ -459,6 +459,9 @@ def main(argv=None):
                         help='Start a new run in review-only mode for cross-rover decisions (live default: automatic alignment)')
     parser.add_argument('--replay', metavar='RUN_DIR', help='Inspect a saved run without ROS/models or changing the recording')
     parser.add_argument('--check', action='store_true', help='Validate config/dependencies without connecting to robots')
+    parser.add_argument('--clip-preset', choices=CLIP_PRESETS,
+                        help='Select the shared image/text encoder for a new run (or --check). '
+                             'Omit to use the selected config; vit-l-14 restores the OpenAI baseline.')
     parser.add_argument('--port', type=int, help='Override loopback dashboard port (default 8766)')
     parser.add_argument('--duration', type=float, help='Stop after this many seconds (useful for tests)')
     parser.add_argument('--prompt-relay-password', action='store_true',
@@ -472,11 +475,18 @@ def main(argv=None):
         parser.error('--replay cannot be combined with --demo, --resume, or --run-dir')
     if args.shadow_mode and (args.resume or args.replay or args.setup_relay_auth):
         parser.error('--shadow-mode is a startup option for new runs; existing runs retain their checkpoint mode')
+    if args.clip_preset and (args.resume or args.replay or args.setup_relay_auth):
+        parser.error('--clip-preset is only for new runs or their configuration check; '
+                     'saved runs retain their recorded encoder')
     if args.duration is not None and (not np.isfinite(args.duration) or args.duration <= 0):
         parser.error('--duration must be positive and finite')
     existing = owned_run_directory(args.replay or args.run_dir, resume=True) if args.replay or args.resume else None
     config_path = args.config or (existing/'config.json' if existing else ROOT/'config'/'collaborative_two_rovers.json')
     config = load_config(config_path)
+    try:
+        clip = configure_shared_clip(config, args.clip_preset)
+    except ValueError as error:
+        parser.error(str(error))
     if args.shadow_mode or (args.demo and not existing and not args.config):
         # Preserve the review-first synthetic walkthrough without changing a
         # user's explicit demo profile or the real two-rover default.
@@ -507,6 +517,8 @@ def main(argv=None):
     check_environment(config, args.demo or bool(args.replay))
     if args.check:
         print(json.dumps({'status':'ready', 'central_domain':config['central_domain'],
+                          'clip':{'model_name':clip['clip_model_name'], 'pretrained':clip['clip_pretrained'],
+                                  'weights_checked':False},
                           'robots':[{k:r[k] for k in ('id','domain','local_frame','base_frame','depth_registration')} for r in config['robots']],
                           'dashboard':config['dashboard'], 'mode':'replay' if args.replay else 'demo' if args.demo else 'live',
                           'startup_alignment':'from checkpoint' if existing else

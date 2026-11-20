@@ -6,6 +6,10 @@ from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parent
+CLIP_PRESETS = {
+    "mobileclip2-s2": {"clip_model_name": "MobileCLIP2-S2", "clip_pretrained": "dfndr2b"},
+    "vit-l-14": {"clip_model_name": "ViT-L-14", "clip_pretrained": "openai"},
+}
 DEFAULT_CONFIG = {
     "central_domain": 42,
     "dashboard": {"host": "127.0.0.1", "port": 8766},
@@ -15,8 +19,9 @@ DEFAULT_CONFIG = {
         "min_depth_m": 0.2, "max_depth_m": 8.0,
     },
     "perception": {"parameters": {
-        "esam_variant": "vitt", "clip_model_name": "ViT-L-14",
-        "clip_pretrained": "openai", "dinov2_model_name": "dinov2_vits14",
+        # Preserve the meaning of older partial configs. Only the packaged
+        # fresh-run profile opts into the MobileCLIP2 trial.
+        "esam_variant": "vitt", **CLIP_PRESETS["vit-l-14"], "dinov2_model_name": "dinov2_vits14",
         "stationary_pose_lock": False,
     }},
     "pose_guard": {
@@ -65,6 +70,25 @@ def _number(value, name, lower, upper):
 def load_config(path=None):
     custom = {} if path is None else json.loads(Path(path).read_text())
     return validate_config(custom)
+
+
+def configure_shared_clip(config, preset=None):
+    """Resolve the effective fleet encoder; apply an explicit override only if compatible."""
+    base = config["perception"]["parameters"]
+    desired = CLIP_PRESETS[preset] if preset is not None else None
+    selected = None
+    for robot in config["robots"]:
+        local = robot["parameters"]
+        if desired and any(key in local and local[key] != value for key, value in desired.items()):
+            raise ValueError(f"--clip-preset {preset} conflicts with {robot['id']}.parameters; "
+                             "remove the per-rover CLIP override to use a shared preset")
+        actual = {key: local.get(key, (desired or base)[key]) for key in ("clip_model_name", "clip_pretrained")}
+        if selected is not None and actual != selected:
+            raise ValueError("All rovers must use the same CLIP model and pretrained weights")
+        selected = actual
+    if desired:
+        base.update(desired)
+    return selected
 
 
 def validate_config(config):

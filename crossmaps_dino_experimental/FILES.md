@@ -16,6 +16,7 @@ Its complete startup and operating guide is [COLLABORATIVE.md](COLLABORATIVE.md)
 | `collab_camera_relay.py` / `collab_camera_relay_source.py` | Optional authenticated, bounded compressed RGB-D fallback for Wi-Fi; laptop receiver and ephemeral sensor-only sampler inside the running rover container. |
 | `collab_runtime.py` | Fair bounded latest-frame scheduling and completed-cycle timing. |
 | `collab_perception.py` | Shared model objects with separate source/session v2 memories; pose contradiction guard and observation evidence extraction. |
+| `clip_inference.py` | Runtime OpenCLIP weight, preprocessing and tokenizer loader for both entry points; fuses the MobileCLIP2-S2 model for inference. |
 | `collab_backend.py` | Keyframes/submaps, candidate retrieval, source/session provenance, pose constraints, reversible global identity links and persistence. |
 | `collab_provisional.py` | Display-only provisional alignment from agreeing, verified RGB-D captures; confirmed graph and object identities stay separate. |
 | `collab_identity_inspector.py` | Read-only identity review: contributing camera frames, projected surface samples and explanations of pending or suspended links. |
@@ -76,6 +77,7 @@ root-level perception script, or root-level dashboard is imported by this versio
 
 ## Development and diagnostic files
 
+- `benchmark_clip.py`: cache-only A/B of the trial and baseline encoders on recorded surface crops; no rover inputs or changes to saved runs.
 - `tests/`: Python regression tests, Node.js dashboard tests, and the offline
   `dashboard_fixture.py` UI fixture. Not required for normal perception runs.
 - `replay_identity.py`: offline identity/assembly replay and synthetic demo.

@@ -130,13 +130,63 @@ setup. Missing settings inherit validated defaults from `collab_config.py`.
 | `pose_guard.rgbd_recovery` | `true`; allows a local mapping pose to be recovered from a previously observed RGB-D view after repeated geometric and image agreement |
 | `perception.parameters` | Shared v2 model/processing defaults; robot-specific non-model settings can use `robots[].parameters` |
 
-The model defaults remain **eSAM ViT-T**, **CLIP ViT-L-14 / OpenAI**, and
-**DINOv2 ViT-S/14**. There is one full-frame DINO feature pass and one configured
-CLIP crop per mask, not an extra set of per-instance DINO model passes.
-Model-weight loading/caches use the existing v2 environment. Do not configure
-incompatible model variants for the two sources: descriptors must share a
-feature space to be comparable. Stationary pose lock is explicitly unsupported
-in collaborative mode.
+### CLIP encoder trial
+
+The shipped two-rover profile uses **MobileCLIP2-S2 / dfndr2b** in place of
+OpenAI ViT-L/14. Both rovers share one image and text encoder on the laptop.
+eSAM ViT-T, DINOv2 ViT-S/14, one context crop per mask, and the geometric
+verification and identity thresholds have not changed. The standalone v2 node
+and older configs that do not specify a CLIP encoder keep the baseline.
+
+Run the normal launch for the trial, or append `--clip-preset vit-l-14` for the
+baseline. Add `--check` to print the selected model and weight tag without
+downloading weights. Switch encoders **only on a fresh run**: the new 512-D
+descriptors and the previous 768-D descriptors are not interchangeable. Resume
+and replay keep the recording's model settings; neither migrates old embeddings.
+
+Use OpenCLIP ≥3.2 with timm FastViT support (tested: 3.2.0 / 1.0.24). The loader
+uses the registered tokenizer and evaluation transform and fuses the FastViT
+branches once before inference. On a new laptop, pre-cache the ~398 MB
+[OpenCLIP weights](https://huggingface.co/timm/MobileCLIP2-S2-OpenCLIP)
+while online so the rover LAN does not need internet:
+
+```sh
+python3 -c "from huggingface_hub import hf_hub_download; hf_hub_download('timm/MobileCLIP2-S2-OpenCLIP', 'open_clip_model.safetensors')"
+```
+
+Once cached, prefix the live command with `HF_HUB_OFFLINE=1` on the rover LAN
+to skip Hugging Face network checks entirely. Keep the usual local DINO/eSAM
+weights available as before.
+
+The weights are under [Apple's noncommercial research license](https://github.com/apple-aiml-research/ml-mobileclip/blob/main/LICENSE_MODELS).
+Published zero-shot benchmarks are not rover-mask ground truth. When comparing
+runs, look at query ranking and false cross-rover entity links as well as CLIP
+inference time; a cosine threshold calibrated on ViT-L/14 need not transfer.
+
+Offline trial on the project MacBook (PyTorch 2.10, MPS, FP32): 64 identical RGB
+boxes projected from retained surfaces in 16 two-rover keyframes. These are crop
+proxies, not the original eSAM masks. Timings are median batch times over 10
+synchronized iterations after 3 warmups, including resize, encode, normalize
+and return to CPU. They exclude eSAM, DINO, geometry and networking.
+
+| Measurement | Existing ViT-L/14 | MobileCLIP2-S2 |
+| --- | ---: | ---: |
+| One crop | 167 ms | 14 ms |
+| Eight crops | 306 ms | 56 ms |
+| Model parameter storage (both towers) | 1,631 MiB | 378 MiB |
+| Peak process RSS including model load (not GPU memory) | 3,617 MiB | 1,185 MiB |
+| Retrieved same recorded local surface ID in another frame | 57/60 | 57/60 |
+
+The ID check uses each rover's existing track IDs, not independent labels; it
+does not test text relevance or prove that two rovers will agree on an object.
+The baseline uses the historical `ViT-L-14/openai` invocation unchanged,
+including OpenCLIP's QuickGELU configuration warning. To repeat with cached
+weights and any completed local recording, from the repository root:
+
+```sh
+python3 crossmaps_dino_experimental/benchmark_clip.py \
+  crossmaps_dino_experimental/.runtime/collaboration/RUN_ID --device mps
+```
 
 ### Timestamp and calibration requirements
 

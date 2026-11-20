@@ -21,6 +21,11 @@ The normal live command uses SSH keys or host-specific Mac Keychain entries
 for automatic compressed-camera recovery. On a new Mac with password-based
 rovers, run the same command with `--setup-relay-auth` once.
 
+The packaged two-rover profile now uses **MobileCLIP2-S2** for mask crops and
+text queries. For a fresh run with the previous OpenAI encoder, append
+`--clip-preset vit-l-14`. Saved runs retain their original feature space.
+See [the CLIP trial notes](COLLABORATIVE.md#clip-encoder-trial) for offline use and licensing.
+
 New live runs start in **automatic alignment mode**. Use `--shadow-mode` to
 start a fresh run in review mode instead. You can see a **provisional**
 combined map when several strong RGB-D matches agree, even

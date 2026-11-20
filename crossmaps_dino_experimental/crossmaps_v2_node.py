@@ -65,7 +65,7 @@ def _patch_torchvision_import_for_jetson():
 
 _patch_torchvision_import_for_jetson()
 
-import open_clip
+from clip_inference import load_clip_for_inference
 from PIL import Image as PILImage
 
 import message_filters
@@ -953,16 +953,11 @@ class CrossMapsNode(Node):
             self.device = "cpu"
         self.get_logger().info(f"Using device: {self.device}")
 
-        # MODEL SELECTION -> ViT-B-32 is faster but less accurate, ViT-L-14 is slower but better
         model_name = str(self.get_parameter("clip_model_name").value)
         pretrained = str(self.get_parameter("clip_pretrained").value)
         if shared_models is None:
-            self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-                model_name=model_name, pretrained=pretrained
-            )
-            self.tokenizer = open_clip.get_tokenizer(model_name)
-            self.model.eval()
-            self.model.to(self.device)
+            self.model, self.preprocess, self.tokenizer = load_clip_for_inference(model_name, pretrained, self.device)
+            self.get_logger().info(f"CLIP: {model_name}/{pretrained} on {self.device}")
         else:
             self.model = shared_models["model"]
             self.preprocess = shared_models["preprocess"]

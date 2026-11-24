@@ -58,6 +58,11 @@ macOS security or install Linux graphics shims.
 
 ## Drive the simulated robots
 
+The simulation dashboard also includes a read-only **Simulation evaluation**
+panel backed by Gazebo ground truth. This does not influence mapping or driving.
+See [evaluation metrics and experiment design](EVALUATION.md) for definitions,
+limitations, storage, and the planned larger-map/rendezvous tests.
+
 ### Nav2 and click-to-drive
 
 Double-click **`simulation/gazebo/start-navigation.command`**, or run:

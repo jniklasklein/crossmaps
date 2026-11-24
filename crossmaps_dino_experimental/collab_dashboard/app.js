@@ -37,6 +37,53 @@ function anchorTransform(x, y, z, yawDegrees) {
 function normalizeSnapshot(raw) {
   return { ...raw, robots: Array.isArray(raw.robots) ? raw.robots : [], submaps: Array.isArray(raw.submaps) ? raw.submaps : [], candidates: Array.isArray(raw.candidates) ? raw.candidates : [], constraints: Array.isArray(raw.constraints) ? raw.constraints : [], global_entities: Array.isArray(raw.global_entities) ? raw.global_entities : (raw.entities || []), entity_links: Array.isArray(raw.entity_links) ? raw.entity_links : [], events: Array.isArray(raw.events) ? raw.events : [], stats: raw.stats || {} };
 }
+const evaluationCount = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+function simulationEvaluationModel(snapshot, connected = true) {
+  const data = snapshot.simulation_evaluation;
+  if (!data || data.enabled !== true) return null;
+  const recorded = data.recorded === true || snapshot.mode === "recorded_replay";
+  const status = !connected ? "disconnected" : data.schema !== 1 ? "invalid" : ["ready", "waiting", "stale", "invalid"].includes(data.status) ? data.status : "waiting";
+  return { ...data, recorded, status, measured: status === "ready", coverage: data.coverage || {},
+    local: Array.isArray(data.local) ? data.local : [], shared: data.shared || {}, optimization: data.optimization || {}, loops: data.loops || {},
+    reason: !connected ? `Coordinator disconnected; ${recorded ? "recorded evaluation cannot be refreshed" : "live evaluation is unavailable"}.` : data.schema !== 1 ? "Unsupported evaluation schema; measurements are unavailable." : data.reason || "",
+    notes: Array.isArray(data.notes) ? data.notes : [] };
+}
+function evaluationInterval(value) {
+  const low = Array.isArray(value) ? value[0] : value?.min, high = Array.isArray(value) ? value[1] : value?.max;
+  if (!finite(low) || !finite(high) || low <= 0 || high < low) return "interval unavailable";
+  return `${low.toFixed(1)}–${high.toFixed(1)} s between retained captures`;
+}
+function simulationEvaluationContent(model) {
+  if (!model) return "";
+  const measured = model.measured, coverage = model.coverage;
+  const count = value => evaluationCount(value) ?? "—";
+  const metric = (value, units, n, digits = 3) => measured && evaluationCount(n) > 0 && finite(value) && value >= 0 ? `${value.toFixed(digits)} ${units}` : "Unavailable";
+  const pairMetric = row => `${metric(row.translation_rmse_m, "m", row.pairs)} / ${metric(row.rotation_rmse_deg, "°", row.pairs, 2)}`;
+  const state = model.recorded ? `Recorded evaluation${model.status === "ready" ? "" : " · unavailable"}` : {ready:"Ground truth connected", waiting:"Waiting for evaluation", stale:"Ground truth stale", invalid:"Evaluation unavailable", disconnected:"Evaluation disconnected"}[model.status];
+  const captured = finite(model.updated_unix) && Math.abs(model.updated_unix) <= 8.64e12 ? new Date(model.updated_unix * 1000).toISOString() : "time unavailable";
+  const reason = model.recorded ? `Snapshot captured: ${captured}. Saved measurements, not a live ground-truth connection. ${model.reason}` : model.reason || "Capture-time ground truth is used only for scoring, never for mapping or alignment.";
+  const confirmed = model.shared.confirmed || {}, provisional = model.shared.provisional || {}, opt = model.optimization, loops = model.loops;
+  const percentage = (value, n) => measured && evaluationCount(n) > 0 && finite(value) && value >= 0 && value <= 1 ? `${(100*value).toFixed(1)}%` : "Unavailable";
+  const precision = percentage(loops.precision, loops.evaluated), acceptedPrecision = percentage(loops.accepted_precision, loops.accepted_evaluated);
+  const rows = model.local.filter(row => row && typeof row === "object").map(row => `<tr><th scope="row">${escapeText(row.robot_id || "Unknown rover")}<small>${count(row.samples)} associated keyframes</small></th>
+    <td>${metric(row.position_rmse_m, "m", row.samples)}<small>${metric(row.rotation_rmse_deg, "°", row.samples, 2)} rotation</small></td>
+    <td>${metric(row.rpe_translation_rmse_m, "m", row.rpe_pairs)}<small>${metric(row.rpe_rotation_rmse_deg, "°", row.rpe_pairs, 2)} rotation · ${count(row.rpe_pairs)} pairs</small></td>
+    <td>${escapeText(evaluationInterval(row.rpe_interval_s))}</td></tr>`).join("");
+  return `<div class="evaluation-status"><span class="badge ${model.recorded ? "reference" : model.status === "ready" ? "healthy" : "pending"}">${state}</span><p title="${escapeText(reason)}">${escapeText(reason)}</p></div>
+    <p class="panel-note evaluation-coverage">${model.recorded ? "Truth age at recording" : "Truth age"}: ${ageLabel(coverage.truth_age_s)} · Associated retained keyframes: ${count(coverage.associated)} / ${count(coverage.keyframes)} · Missing truth: ${count(coverage.missing)}</p>
+    <div class="evaluation-grid">
+      <article class="evaluation-card"><h3>Cross-rover keyframe relative pose</h3><p class="evaluation-label">Translation / rotation RMSE</p><dl><div><dt>Confirmed</dt><dd>${pairMetric(confirmed)}<small>${count(confirmed.pairs)} scored pairs</small></dd></div><div><dt>Provisional</dt><dd>${pairMetric(provisional)}<small>${count(provisional.pairs)} scored pairs</small></dd></div></dl><p>Compared at each keyframe’s own capture time; not a simultaneous live robot-position measurement.</p></article>
+      <article class="evaluation-card"><h3>Local baseline vs optimized map</h3><p class="evaluation-label">Same reference · ${count(opt.samples)} keyframes</p><dl><div><dt>Raw local poses</dt><dd>${metric(opt.raw_position_rmse_m, "m", opt.samples)}<small>${metric(opt.raw_rotation_rmse_deg, "°", opt.samples, 2)} rotation RMSE</small></dd></div><div><dt>Optimized poses</dt><dd>${metric(opt.optimized_position_rmse_m, "m", opt.samples)}<small>${metric(opt.optimized_rotation_rmse_deg, "°", opt.samples, 2)} rotation RMSE</small></dd></div></dl><p>Raw local poses use the current first-keyframe alignment. These are ground-truth errors, not graph solver cost; this is not a controlled PGO on/off experiment.</p></article>
+      <article class="evaluation-card"><h3>Cross-rover closure measurements</h3><p class="evaluation-label">Geometric correctness of scored constraints</p><dl><div><dt>Verified / accepted</dt><dd>${precision}<small>${count(loops.correct)} / ${count(loops.evaluated)} within tolerance</small></dd></div><div><dt>Accepted only</dt><dd>${acceptedPrecision}<small>${count(loops.accepted_correct)} / ${count(loops.accepted_evaluated)} within tolerance</small></dd></div><div><dt>Measurement RMSE</dt><dd>${metric(loops.translation_rmse_m, "m", loops.evaluated)}<small>${metric(loops.rotation_rmse_deg, "°", loops.evaluated, 2)} rotation</small></dd></div></dl><p>Tolerance: ${finite(loops.translation_threshold_m) ? `${loops.translation_threshold_m.toFixed(2)} m` : "unavailable"} and ${finite(loops.rotation_threshold_deg) ? `${loops.rotation_threshold_deg.toFixed(1)}°` : "unavailable"}. This is not loop-detection recall.</p></article>
+    </div>
+    <div class="evaluation-local"><h3>Per-rover local odometry</h3><div class="evaluation-table-wrap"><table><thead><tr><th scope="col">Rover</th><th scope="col">First-pose anchored RMSE</th><th scope="col">Relative pose error RMSE</th><th scope="col">RPE sampling interval</th></tr></thead><tbody>${rows || '<tr><td colspan="4">Waiting for timestamp-associated captures.</td></tr>'}</tbody></table></div><p>Local baselines are anchored independently at each rover’s first pose. They do not measure cross-rover alignment. RPE uses adjacent retained captures with the intervals shown, not a fixed one-second benchmark.</p></div>
+    <div class="panel-note evaluation-limits"><strong>Not yet measured:</strong> observed-surface IoU / F-score, loop-detection recall, and SLAM Toolbox’s single-rover loop closures. Sparse-map overlap alone is not localization accuracy.${model.notes.length ? `<ul>${model.notes.map(note => `<li>${escapeText(note)}</li>`).join("")}</ul>` : ""}</div>`;
+}
+function renderSimulationEvaluation(panel, content, snapshot, connected = true) {
+  const model = simulationEvaluationModel(snapshot, connected);
+  panel.hidden = !model;
+  content.innerHTML = simulationEvaluationContent(model);
+}
 const byteLabel = value => !finite(value) || value < 0 ? "Unknown" : value < 1024 ? `${Math.round(value)} B` : value < 1024 ** 2 ? `${(value / 1024).toFixed(1)} KiB` : value < 1024 ** 3 ? `${(value / 1024 ** 2).toFixed(1)} MiB` : `${(value / 1024 ** 3).toFixed(2)} GiB`;
 const storageRunId = value => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value);
 function storageModel(snapshot, connected = true) {
@@ -1056,12 +1103,13 @@ $("entities").insertAdjacentHTML("beforeend", proposedLinks.map((link) => `<arti
       $("shadow").checked = snapshot.shadow_mode !== false; $("shadow").disabled = !snapshot._dashboard?.commands_enabled;
       $("shadow-explanation").textContent = shadowDescription(snapshot.shadow_mode);
       renderRobots(snapshot.robots); ensureCameras(); renderEvidence(); inspector.checkSnapshot(); storage.refresh();
+      renderSimulationEvaluation($("simulation-evaluation"), $("simulation-evaluation-content"), snapshot, connected);
       const key = JSON.stringify([snapshot.revision, snapshot.shadow_mode, source, $("color-mode").value, $("budget").value,
         snapshot.robots.map(r => [r.session_id, r.trajectory?.latest?.seq, r.trajectory?.tracking_lost, mappingPaused(r), r.map_observation_age_s > 8]),
         snapshot.submaps.map((s) => [s.id, s.aligned, s.alignment_state, s.T_preview_world_submap, s.pose_version, s.points?.length])]);
       if (key !== lastRenderKey || snapshot.revision === undefined) { renderMap(); lastRenderKey = key; }
       refreshCameraCaptions();
-    } catch (error) { const wasConnected = connected; connected = false; $("connection-dot").classList.remove("online"); $("connection").textContent = `Disconnected · ${error.message}`; for (const button of document.querySelectorAll("[data-action], #save, #anchor-form button")) button.disabled = true; $("shadow").disabled = true; storage.refresh(); if (wasConnected) { lastRenderKey = ""; renderMap(); } refreshCameraCaptions(); }
+    } catch (error) { const wasConnected = connected; connected = false; $("connection-dot").classList.remove("online"); $("connection").textContent = `Disconnected · ${error.message}`; for (const button of document.querySelectorAll("[data-action], #save, #anchor-form button")) button.disabled = true; $("shadow").disabled = true; storage.refresh(); renderSimulationEvaluation($("simulation-evaluation"), $("simulation-evaluation-content"), snapshot, connected); if (wasConnected) { lastRenderKey = ""; renderMap(); } refreshCameraCaptions(); }
     finally { pollBusy = false; }
   }
   async function fullscreen(element) { try { if (document.fullscreenElement) await document.exitFullscreen(); else if (element.requestFullscreen) await element.requestFullscreen(); else notify("Full screen is unavailable in this browser. Increase the browser window to enlarge the view."); } catch (error) { notify(error.message, true); } }
@@ -1080,5 +1128,5 @@ $("entities").insertAdjacentHTML("beforeend", proposedLinks.map((link) => `<arti
   const images = () => { refreshCameraCaptions(); for (const [id, camera] of cameraState) refreshCamera(id, camera); setTimeout(images, 1000); }; images();
 }
 
-if (typeof module !== "undefined" && module.exports) module.exports = { robotId, escapeText, ageLabel, matrix, transformPoint, inverseRigid, matrixProduct, anchorTransform, normalizeSnapshot, buildCloud, buildRoverOverlay, projectMarker, drawRoverOverlay, roverPoseLegend, candidateConstraint, activeEntityLink, modePresentation, imageAge, orderedCandidates, currentComponent, mappingPaused, healthPresentation, healthState, roverHealthCard, roverCardRenderer, displayedImageAge, receivedImageAge, abortableDecode, frameWarning, imageCaption, shadowDescription, alignmentEvidence, candidateReason, evidenceRenderKey, identityUrl, selectedWitness, witnessImage, identityContent, identityRequestReader, identityLinkSignature, identityFromHash, installIdentityInspector, byteLabel, storageModel, storageOverview, storageRunsContent, storagePlanContent, storageResult, storageController, installStorageDialog };
+if (typeof module !== "undefined" && module.exports) module.exports = { robotId, escapeText, ageLabel, matrix, transformPoint, inverseRigid, matrixProduct, anchorTransform, normalizeSnapshot, buildCloud, buildRoverOverlay, projectMarker, drawRoverOverlay, roverPoseLegend, candidateConstraint, activeEntityLink, modePresentation, imageAge, orderedCandidates, currentComponent, mappingPaused, healthPresentation, healthState, roverHealthCard, roverCardRenderer, displayedImageAge, receivedImageAge, abortableDecode, frameWarning, imageCaption, shadowDescription, alignmentEvidence, candidateReason, evidenceRenderKey, identityUrl, selectedWitness, witnessImage, identityContent, identityRequestReader, identityLinkSignature, identityFromHash, installIdentityInspector, byteLabel, storageModel, storageOverview, storageRunsContent, storagePlanContent, storageResult, storageController, installStorageDialog, simulationEvaluationModel, simulationEvaluationContent, evaluationInterval, renderSimulationEvaluation };
 if (typeof document !== "undefined") { if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", startDashboard); else startDashboard(); }

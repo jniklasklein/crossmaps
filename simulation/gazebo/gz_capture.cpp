@@ -7,6 +7,7 @@
 #include <gz/msgs/odometry.pb.h>
 #include <gz/msgs/laserscan.pb.h>
 #include <gz/msgs/twist.pb.h>
+#include <gz/msgs/pose_v.pb.h>
 #include <google/protobuf/util/json_util.h>
 #include <algorithm>
 #include <atomic>
@@ -44,8 +45,8 @@ template<class Message> void receive(const std::string &kind, const Message &msg
 }
 
 int main(int argc, char **argv) {
-  if (argc < 2 || (std::string(argv[1]) != "rover_a" && std::string(argv[1]) != "rover_b")) {
-    std::cerr << "Usage: gz_capture rover_a|rover_b [clock_topic]\n"; return 2;
+  if (argc < 2 || (std::string(argv[1]) != "rover_a" && std::string(argv[1]) != "rover_b" && std::string(argv[1]) != "evaluation")) {
+    std::cerr << "Usage: gz_capture rover_a|rover_b|evaluation [clock_topic]\n"; return 2;
   }
   // Never attach to the default/global simulator transport partition.
   const char *partition = std::getenv("GZ_PARTITION");
@@ -54,6 +55,29 @@ int main(int argc, char **argv) {
   }
   std::signal(SIGINT, stop); std::signal(SIGTERM, stop); std::signal(SIGPIPE, SIG_IGN);
   gz::transport::Node node;
+  if (std::string(argv[1]) == "evaluation") {
+    // Read-only scoring channel. No sensor, odometry, TF or command publisher
+    // exists in this mode, and ground truth never enters the ROS bridges.
+    bool ok = true;
+    for (const std::string robot : {"rover_a", "rover_b"}) {
+      ok &= node.Subscribe<gz::msgs::Pose_V>("/model/"+robot+"/pose",
+        [robot](const gz::msgs::Pose_V &m){
+          if (m.pose_size() > 8) return;
+          receive(robot,m);
+        });
+    }
+    ok &= node.Subscribe<gz::msgs::Clock>("/clock", [kind=std::string("clock")](const gz::msgs::Clock &m){receive(kind,m);});
+    if (!ok) { std::cerr << "Ground-truth subscriptions failed\n"; return 3; }
+    while (running) {
+      std::map<std::string,std::string> batch;
+      { std::lock_guard<std::mutex> lock(pendingMutex); batch.swap(pending); }
+      for (const auto &packet : batch) std::cout << packet.second;
+      std::cout.flush();
+      if (!std::cout) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return 0;
+  }
   const std::string root = "/" + std::string(argv[1]);
   const std::string clockTopic = argc > 2 ? argv[2] : "/clock";
   bool ok = true;

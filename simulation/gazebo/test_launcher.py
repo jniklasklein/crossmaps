@@ -179,7 +179,12 @@ class LauncherTests(unittest.TestCase):
         coordinator = mocks[2].call_args_list[-1].args[0]
         self.assertIn(str(run.CONFIG), coordinator)
         self.assertNotIn('--resume', coordinator)
-        self.assertEqual(len(mocks[4].call_args.args[0]), 4)
+        self.assertEqual(len(mocks[4].call_args.args[0]), 5)
+        self.assertIn('--simulation-truth', coordinator)
+        self.assertIn('--simulation-scene', coordinator)
+        ground_truth = mocks[2].call_args_list[-2].args[0]
+        self.assertIn(str(root/'ground_truth.py'), ground_truth)
+        self.assertIn(str(root/'logs/truth.json'), ground_truth)
         probe = mocks[5].return_value.__enter__.return_value
         probe.setsockopt.assert_called_once_with(run.socket.SOL_SOCKET, run.socket.SO_REUSEADDR, 1)
         probe.bind.assert_called_once_with(('127.0.0.1', 8767))
@@ -193,6 +198,16 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, 2)
                 python.assert_not_called()
 
+    def test_sensors_only_has_no_evaluator_or_coordinator(self):
+        args, root, processes, mocks = self.launch_fixture(sensors_only=True)
+        clock = iter([0., 1., 2.])
+        with patch.object(run.time, 'monotonic', side_effect=lambda: next(clock)):
+            self.assertEqual(run.launch(args, '/ros/python', root/'logs', {}, {}, '/gz', '/cmake'), 0)
+        commands = [call.args[0] for call in mocks[2].call_args_list]
+        self.assertEqual(len(commands), 3)
+        self.assertFalse(any('ground_truth.py' in str(command) or 'crossmaps_collaborative.py' in str(command)
+                             for command in commands))
+
     def test_nav2_both_robots_have_separate_owned_supervisors_and_selected_rviz(self):
         args, root, processes, mocks = self.launch_fixture()
         args.nav2, args.rviz = True, 'rover_b'
@@ -201,12 +216,12 @@ class LauncherTests(unittest.TestCase):
                 patch.object(run, 'navigation_ready', return_value=True):
             self.assertEqual(run.launch(args, '/ros/python', root/'logs', {}, {}, '/gz', '/cmake'), 0)
         commands = [call.args[0] for call in mocks[2].call_args_list]
-        self.assertEqual(len(commands), 6)
-        self.assertIn('rover_a', commands[4])
-        self.assertIn('--no-rviz', commands[4])
-        self.assertIn('rover_b', commands[5])
-        self.assertNotIn('--no-rviz', commands[5])
-        self.assertEqual(len(mocks[4].call_args.args[0]), 6)
+        self.assertEqual(len(commands), 7)
+        self.assertIn('rover_a', commands[5])
+        self.assertIn('--no-rviz', commands[5])
+        self.assertIn('rover_b', commands[6])
+        self.assertNotIn('--no-rviz', commands[6])
+        self.assertEqual(len(mocks[4].call_args.args[0]), 7)
 
     def test_navigation_ready_requires_current_owned_process_and_recent_report(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(run.time, 'time', return_value=100.):

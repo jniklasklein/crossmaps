@@ -72,6 +72,35 @@ class NativeBridgeTests(unittest.TestCase):
             helper.stdout.close()
             helper.stderr.close()
 
+    def test_evaluation_is_read_only_and_preserves_named_pose(self):
+        gz = shutil.which('gz')
+        self.assertIsNotNone(gz)
+        helper = subprocess.Popen([str(self.helper), 'evaluation'], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+        try:
+            message = ('header { stamp { sec: 7 nsec: 123 } } '
+                       'pose { name: "rover_b" position { x: 1.2 y: -3 } orientation { w: 1 } }')
+            packet = None
+            for _ in range(3):
+                subprocess.run([gz, 'topic', '-t', '/model/rover_b/pose', '-m', 'gz.msgs.Pose_V', '-p', message],
+                               env=self.env, capture_output=True, check=True, timeout=5.)
+                if select.select([helper.stdout], [], [], 1.)[0]:
+                    packet = json.loads(helper.stdout.readline()); break
+            self.assertIsNotNone(packet)
+            self.assertEqual(packet['kind'], 'rover_b')
+            self.assertEqual(packet['message']['pose'][0]['name'], 'rover_b')
+            self.assertEqual(int(packet['message']['header']['stamp']['sec']), 7)
+            topics = subprocess.run([gz, 'topic', '-l'], env=self.env, capture_output=True,
+                                    check=True, timeout=5.).stdout
+            self.assertNotIn(b'cmd_vel', topics)
+        finally:
+            helper.terminate()
+            try:
+                helper.wait(timeout=3.)
+            except subprocess.TimeoutExpired:
+                helper.kill(); helper.wait(timeout=3.)
+            helper.stdout.close(); helper.stderr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

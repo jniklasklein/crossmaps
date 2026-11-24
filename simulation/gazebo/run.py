@@ -273,7 +273,12 @@ def launch(args, python, logs, native, ros, gz, cmake):
             if not args.no_gui:
                 start("gui", [gz, "sim", "--force-version", "8", "-g", "-v", "2"], native)
             if not args.sensors_only:
-                start("crossmaps", [python, str(APP / "crossmaps_collaborative.py"), "--config", str(CONFIG)], ros)
+                truth_path = logs / 'truth.json'
+                start('ground_truth', [python, str(HERE / 'ground_truth.py'), '--helper', str(helper),
+                                       '--output', str(truth_path)], native)
+                start("crossmaps", [python, str(APP / "crossmaps_collaborative.py"), "--config", str(CONFIG),
+                                     '--simulation-truth', str(truth_path),
+                                     '--simulation-scene', str(world.parent / 'scene.json')], ros)
             if args.nav2:
                 navigation = {}
                 for robot, domain in (("rover_a", 80), ("rover_b", 81)):

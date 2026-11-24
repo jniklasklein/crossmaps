@@ -35,9 +35,14 @@ from pipeline_instance import PipelineInstance
 
 class FleetApplication:
     """Owns all writes to backend state and exposes immutable UI snapshots."""
-    def __init__(self, config, run_dir, *, demo=False, fleet=None, replay=False, storage=None):
+    def __init__(self, config, run_dir, *, demo=False, fleet=None, replay=False, storage=None, evaluation=None):
         self.config, self.run_dir, self.demo, self.replay = config, Path(run_dir), demo, replay
         self.storage = storage
+        # Evaluation receives estimates only AFTER mapping. Truth is never
+        # passed to adapters, perception, registration or the pose graph.
+        self.evaluation = evaluation
+        self.evaluation_snapshot = None
+        self.next_evaluation = 0.
         self.mapping_lock = threading.RLock()
         self.map_generation = uuid.uuid4().hex
         self.map_epoch_started = 0.
@@ -85,6 +90,15 @@ class FleetApplication:
         self.next_idle_verification = self.started + 8.
         self.last_ros_publish = 0.
         self._closed = False
+        if replay:
+            report = self.run_dir / 'evidence' / 'evaluation.json'
+            if report.is_file() and not report.is_symlink() and report.stat().st_size < 1024**2:
+                try:
+                    value = json.loads(report.read_text())
+                    if isinstance(value, dict) and value.get('schema') == 1:
+                        self.evaluation_snapshot = dict(value, recorded=True)
+                except (OSError, ValueError):
+                    pass
         if replay:
             for source in self.cached.get('robots', []):
                 self.telemetry.setdefault(source['robot_id'], {}).update(
@@ -298,6 +312,7 @@ class FleetApplication:
     def poll_inputs(self):
         if self.log_budget:
             self.log_budget.tick()
+        self._refresh_evaluation()
         for robot, adapter in self.adapters.items():
             if not adapter['process'].is_alive():
                 with self.state_lock:
@@ -334,6 +349,28 @@ class FleetApplication:
             msg.data = json.dumps(snapshot, allow_nan=False)
             self.state_pub.publish(msg)
             self.last_ros_publish = time.monotonic()
+
+    def _refresh_evaluation(self):
+        if self.evaluation is None or time.monotonic() < self.next_evaluation:
+            return
+        self.next_evaluation = time.monotonic() + 1.
+        with self.backend_lock:
+            try:
+                report = self.evaluation.snapshot(self.backend)
+                # One bounded report, not a growing per-frame log. Stored with
+                # this map generation and removed by Rebuild current map.
+                payload = json.dumps(report, allow_nan=False)
+                if len(payload.encode()) > 1024**2:
+                    raise ValueError('Evaluation report exceeded its size budget')
+                path = self.run_dir / 'evidence' / 'evaluation.json'
+                temporary = path.with_suffix('.json.tmp')
+                temporary.write_text(payload)
+                temporary.replace(path)
+            except Exception as error:
+                report = dict(enabled=True, schema=1, status='invalid',
+                              reason=f'Evaluation unavailable: {error}')
+            with self.state_lock:
+                self.evaluation_snapshot = report
 
     def snapshot(self):
         now = time.monotonic()
@@ -399,6 +436,7 @@ class FleetApplication:
                 active_robot=self.active_robot,
                 processing_age_s=None if self.active_since is None else round(now-self.active_since, 1))
             snapshot['events'] = (snapshot.get('events', [])+list(self.events))[-80:]
+            snapshot['simulation_evaluation'] = deepcopy(self.evaluation_snapshot)
         scheduler = self.scheduler.snapshot()
         fleet_health = self.fleet.health() if self.fleet and not self.map_reset_error else {}
         for data in snapshot['robots']:
@@ -506,6 +544,10 @@ class FleetApplication:
                 result = self.storage.reset_current(token)
                 self.backend = replacement
                 self.backend.store_dir = self.run_dir / 'evidence'
+                if self.evaluation:
+                    self.evaluation.reset()
+                self.evaluation_snapshot = None
+                self.next_evaluation = 0.
                 self.map_generation = uuid.uuid4().hex
                 self.map_reset_error = None
                 with self.scheduler.lock:
@@ -611,6 +653,8 @@ def main(argv=None):
                              'Omit to use the selected config; vit-l-14 restores the OpenAI baseline.')
     parser.add_argument('--port', type=int, help='Override loopback dashboard port (default 8766)')
     parser.add_argument('--duration', type=float, help='Stop after this many seconds (useful for tests)')
+    parser.add_argument('--simulation-truth', type=Path, help='Evaluation-only Gazebo truth sidecar (never a mapping input)')
+    parser.add_argument('--simulation-scene', type=Path, help='Generated simulation scene containing optical extrinsics')
     parser.add_argument('--prompt-relay-password', action='store_true',
                         help='Force a private, session-only SSH password prompt instead of automatic key/Keychain lookup')
     parser.add_argument('--setup-relay-auth', action='store_true',
@@ -630,6 +674,16 @@ def main(argv=None):
     existing = owned_run_directory(args.replay or args.run_dir, resume=True) if args.replay or args.resume else None
     config_path = args.config or (existing/'config.json' if existing else ROOT/'config'/'collaborative_two_rovers.json')
     config = load_config(config_path)
+    if bool(args.simulation_truth) != bool(args.simulation_scene):
+        parser.error('--simulation-truth and --simulation-scene must be supplied together')
+    evaluation = None
+    if args.simulation_truth:
+        if (args.demo or args.resume or args.replay or args.setup_relay_auth
+                or not config['input'].get('use_sim_time') or config['central_domain'] != 82
+                or {(r['id'], r['domain']) for r in config['robots']} != {('rover_a', 80), ('rover_b', 81)}):
+            parser.error('Ground truth evaluation is only available for fresh simulation runs on domains 80/81/82')
+        from collab_evaluation import SimulationEvaluator
+        evaluation = SimulationEvaluator(args.simulation_truth, args.simulation_scene)
     try:
         clip = configure_shared_clip(config, args.clip_preset)
     except ValueError as error:
@@ -687,7 +741,8 @@ def main(argv=None):
                                  readonly=bool(args.replay), owned_domain=config['central_domain'],
                                  domain_lock_held=not bool(args.replay), **config['storage'])
         try:
-            app = FleetApplication(config, run_dir, demo=args.demo, replay=bool(args.replay), storage=storage)
+            app = FleetApplication(config, run_dir, demo=args.demo, replay=bool(args.replay), storage=storage,
+                                   evaluation=evaluation)
         except Exception:
             storage.close()
             raise

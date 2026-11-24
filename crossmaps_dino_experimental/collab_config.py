@@ -14,6 +14,7 @@ DEFAULT_CONFIG = {
     "central_domain": 42,
     "dashboard": {"host": "127.0.0.1", "port": 8766},
     "input": {
+        "use_sim_time": False,
         "max_hz": 2.0, "max_age_s": 2.0, "sync_slop_s": 0.08,
         "tf_timeout_s": 0.08, "tf_wait_budget_s": 6.0, "qos_depth": 5, "max_pixels": 2073600,
         "min_depth_m": 0.2, "max_depth_m": 8.0,
@@ -30,6 +31,8 @@ DEFAULT_CONFIG = {
         "max_yaw_rate_deg_s": 150.0,
     },
     "backend": {"shadow_mode": False},
+    # Aggregate recording budget; no automatic deletion of previous runs.
+    "storage": {"max_total_bytes": 4 * 1024**3, "min_free_bytes": 1024**3, "max_runs": 10},
     "robots": [
         {"id": "rover_a", "domain": 0},
         {"id": "rover_b", "domain": 1},
@@ -98,11 +101,17 @@ def validate_config(config):
     if unknown:
         raise ValueError(f"unknown configuration fields: {sorted(unknown)}")
     config = merge(DEFAULT_CONFIG, config)
-    for section in ('dashboard', 'input', 'perception', 'pose_guard', 'backend'):
+    for section in ('dashboard', 'input', 'perception', 'pose_guard', 'backend', 'storage'):
         if not isinstance(config[section], dict):
             raise ValueError(f'{section} must be an object')
         if section != 'backend' and set(config[section])-set(DEFAULT_CONFIG[section]):
             raise ValueError(f'unknown fields in {section}')
+    for name, bounds in {'max_total_bytes': (1024**2, 64 * 1024**3),
+                         'min_free_bytes': (0, 64 * 1024**3), 'max_runs': (1, 100)}.items():
+        value = config['storage'][name]
+        if type(value) is not int:
+            raise ValueError(f'storage.{name} must be an integer')
+        _number(value, f'storage.{name}', *bounds)
     if not isinstance(config['perception']['parameters'], dict):
         raise ValueError('perception.parameters must be an object')
     _number(config["central_domain"], "central_domain", 0, 101)
@@ -118,6 +127,8 @@ def validate_config(config):
               "sync_slop_s": (.001, .5), "tf_timeout_s": (0, .5), "tf_wait_budget_s": (.1, 10.),
               "qos_depth": (1, 30), "max_pixels": (1024, 8294400),
               "min_depth_m": (.01, 5), "max_depth_m": (.1, 100)}
+    if not isinstance(config['input']['use_sim_time'], bool):
+        raise ValueError('input.use_sim_time must be boolean')
     for name, bounds in limits.items():
         _number(config["input"][name], f"input.{name}", *bounds)
     for name in ('qos_depth', 'max_pixels'):
@@ -157,6 +168,8 @@ def validate_config(config):
             raise ValueError(f'{identifier}.camera_relay has unknown or missing settings; credentials do not belong in config')
         if relay['mode'] not in ('off', 'auto', 'always'):
             raise ValueError(f'{identifier}.camera_relay.mode must be off, auto or always')
+        if config['input']['use_sim_time'] and relay['mode'] != 'off':
+            raise ValueError('Simulation time requires camera_relay.mode=off; hardware SSH timestamps use wall time')
         host, container = relay['ssh_host'], relay['container']
         if not isinstance(host, str) or ((host or relay['mode'] != 'off') and not re.fullmatch(
                 r'(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,31}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,252}', host)):

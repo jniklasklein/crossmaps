@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "license": "CC0-1.0",
+  "license_url": "https://polyhaven.com/license",
+  "license_deed": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "asset": "potted_plant_02",
+  "title": "Potted Plant 02",
+  "author": "Rico Cilliers",
+  "source": "https://polyhaven.com/a/potted_plant_02",
+  "api_manifest": "https://api.polyhaven.com/files/potted_plant_02",
+  "downloaded_at": "2026-11-23",
+  "description": "Terracotta pot, soil surface and individually shaped variegated leaves. Original 69,806-triangle static mesh, with 1k color, OpenGL normal and roughness maps.",
+  "coordinate_system": {
+    "units": "meters",
+    "up": "Y",
+    "gazebo_visual_rpy": [1.5707963267948966, 0, 0],
+    "native_bounds_min": [-0.3966600392, 0.0000529646, -0.4203126028],
+    "native_bounds_max": [0.3044969942, 0.8412317038, 0.2370739728],
+    "pot_collision_radius_m": 0.2371,
+    "pot_collision_height_m": 0.3362
+  },
+  "compatibility": {
+    "format": "glTF 2.0",
+    "gazebo_common5_support": "https://gazebosim.org/api/common/5/namespaces.html",
+    "assimp_import_verified": true,
+    "notes": "Use as a visual mesh with a simple pot collision; do not use all 69,806 triangles as a physics collision mesh. PBR materials are embedded in glTF; do not override the visual material. Roll +pi/2 converts glTF Y-up into Gazebo Z-up."
+  },
+  "modifications": [
+    "The glTF leaf color URI and MIME type use the official RGBA PNG instead of the original JPEG to retain leaf edge transparency. Geometry, UVs, normals and the original MASK alpha cutoff are unchanged. The original JPEG is retained for provenance.",
+    "The original glTF SHA-256 before the URI change was c533dcce0d1aa4379eb7db04601a04983f8df2422b28578de922655a416e64a9."
+  ],
+  "files": [
+    {
+      "path": "potted_plant_02/potted_plant_02_1k.gltf",
+      "source_url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/1k/potted_plant_02/potted_plant_02_1k.gltf",
+      "sha256": "cb431c54c0cd87a91021b412ffc92e2d55a2f16c8d9d8ebd87683e707935bb89"
+    },
+    {
+      "path": "potted_plant_02/potted_plant_02.bin",
+      "source_url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/8k/potted_plant_02/potted_plant_02.bin",
+      "sha256": "9c9812482c78a59789ed32fa842b4cbd9365e09c900c31ebb998e5efe627fe97"
+    },
+    {
+      "path": "potted_plant_02/textures/potted_plant_02_leaves_diff_1k.jpg",
+      "source_url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/potted_plant_02/potted_plant_02_leaves_diff_1k.jpg",
+      "sha256": "3643dce6e6c0a9f40129bd837ec1a11802e8f43ea43cb29e58219d82e0ac632b"
+    },
+    {
+      "path": "potted_plant_02/textures/potted_plant_02_leaves_diff_1k.png",
+      "source_url": "https://dl.polyhaven.org/file/ph-assets/Models/png/1k/potted_plant_02/potted_plant_02_leaves_diff_1k.png",
+      "sha256": "c664ad56c2117d82ea3b6907d0e6554f1d627da05e0f3e28f71e31bea98c667f"
+    },
+    {
+      "path": "potted_plant_02/textures/potted_plant_02_leaves_nor_gl_1k.jpg",
+      "source_url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/potted_plant_02/potted_plant_02_leaves_nor_gl_1k.jpg",
+      "sha256": "e0fe090ff7a511729c9bbe59df7288b400430fdab178529443dec75e0f06007d"
+    },
+    {
+      "path": "potted_plant_02/textures/potted_plant_02_leaves_rough_1k.jpg",
+      "source_url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/potted_plant_02/potted_plant_02_leaves_rough_1k.jpg",
+      "sha256": "ac8959f70c0e91e77f3cd6fd3f73578b8aed64ac6c33fc34ac027a4e88276960"
+    },
+    {
+      "path": "potted_plant_02/textures/potted_plant_02_pot_diff_1k.jpg",
+      "source_url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/potted_plant_02/potted_plant_02_pot_diff_1k.jpg",
+      "sha256": "684949bf24821d7e951d46915366b5a388d2e4ccaaa9d5284e718c83604705e9"
+    },
+    {
+      "path": "potted_plant_02/textures/potted_plant_02_pot_nor_gl_1k.jpg",
+      "source_url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/potted_plant_02/potted_plant_02_pot_nor_gl_1k.jpg",
+      "sha256": "981a68721c8b7b9ac26b96d0210334599d5e8f529362f505082c071a0a58e86c"
+    },
+    {
+      "path": "potted_plant_02/textures/potted_plant_02_pot_rough_1k.jpg",
+      "source_url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/potted_plant_02/potted_plant_02_pot_rough_1k.jpg",
+      "sha256": "4e92ad8ee0f098050785d9a025e2c5a7d55bc7a7f7e1916cc7627fc7824a938f"
+    }
+  ]
+}

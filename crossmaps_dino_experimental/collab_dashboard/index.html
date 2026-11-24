@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>CrossMaps · Collaborative</title><link rel="stylesheet" href="/styles.css"></head>
 <body>
-<header class="topbar"><div class="brand"><span class="brand-mark">CM</span><div><h1>CrossMaps <span>Collaborative</span></h1><p><i id="connection-dot" class="dot"></i><span id="connection">Connecting to coordinator</span></p></div></div><div class="top-actions"><span id="mode-badge" class="badge">Waiting</span><button id="save">Checkpoint</button><button id="help-toggle" aria-expanded="false">How to read this</button></div></header>
+<header class="topbar"><div class="brand"><span class="brand-mark">CM</span><div><h1>CrossMaps <span>Collaborative</span></h1><p><i id="connection-dot" class="dot"></i><span id="connection">Connecting to coordinator</span></p></div></div><div class="top-actions"><span id="mode-badge" class="badge">Waiting</span><button id="save">Checkpoint</button><button id="storage-open">Storage &amp; maps</button><button id="help-toggle" aria-expanded="false">How to read this</button></div></header>
 <aside id="help" class="help" hidden><strong>How to read the shared world.</strong> Each rover keeps its local map. In Combined, round points have a confirmed placement; amber-edged diamonds are provisional and may move or disappear. Unaligned submaps stay out of Combined. Cyan and violet identify the rovers in source-color mode. A supplied anchor is a manual reference, not an automatic match. Shadow mode prevents provisional overlays and automatic acceptance. No dashboard action moves either robot.</aside>
 <div id="notice" class="notice" role="status" hidden></div>
 <main>
@@ -26,5 +26,19 @@
   <p id="identity-status" role="status"></p>
   <div id="identity-content"></div>
   <button type="button" id="identity-reload">Refresh evidence</button>
+</dialog>
+<dialog id="storage-dialog" aria-labelledby="storage-heading">
+  <div class="inspector-heading"><div><span class="eyebrow">LOCAL CROSSMAPS RECORDINGS</span><h2 id="storage-heading">Storage &amp; maps</h2></div><button type="button" id="storage-close" autofocus>Close</button></div>
+  <p id="storage-status" role="status" aria-live="polite"></p>
+  <div id="storage-overview"></div>
+  <div id="storage-controls">
+    <section class="storage-section"><h3>Current map</h3><p>Start a clean CrossMaps map from fresh observations. This permanently removes the current run’s retained map evidence and alignment decisions. Gazebo, Nav2, and the robots’ SLAM maps are not reset.</p><button type="button" id="storage-rebuild">Rebuild current map…</button></section>
+    <section class="storage-section"><h3>Old recordings</h3><p>Only selected, inactive recordings can be freed. Active or protected recordings are never selected automatically. A new map does not import earlier runs.</p><div id="storage-runs" class="storage-runs" aria-label="Stored recordings"></div><button type="button" id="storage-delete" disabled>Free selected old recordings…</button></section>
+  </div>
+  <section id="storage-confirmation" class="storage-confirmation" hidden aria-labelledby="storage-confirm-heading">
+    <h3 id="storage-confirm-heading">Confirm permanent removal</h3><div id="storage-plan"></div>
+    <p class="storage-danger">This cannot be undone. A checkpoint inside the same recording is not a separate backup.</p>
+    <div class="storage-actions"><button type="button" id="storage-cancel">Cancel</button><button type="button" id="storage-confirm" class="danger">Confirm permanent removal</button></div>
+  </section>
 </dialog>
 <footer>CrossMaps collaborative experiment · Local evidence remains source-owned · Mapping only, no robot control</footer><script src="/app.js"></script></body></html>

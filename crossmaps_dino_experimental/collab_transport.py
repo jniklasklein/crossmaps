@@ -14,6 +14,38 @@ import cv2
 import numpy as np
 
 
+class SimulationClockState:
+    """Track ROS time without allowing a world reset to reuse an old map epoch.
+
+    A stopped clock may mean an intentional pause OR a failed /clock publisher;
+    do not pretend to distinguish them. A backwards jump is latched until the
+    adapter is restarted. All liveness / queue deadlines remain monotonic.
+    """
+    def __init__(self, clock=time.monotonic, stall_s=3.):
+        self.clock, self.stall_s = clock, float(stall_s)
+        self.last_ns = 0
+        self.last_progress = clock()
+        self.reset = False
+
+    def invalidate(self):
+        self.reset = True
+
+    def observe(self, now_ns):
+        now_ns = int(now_ns)
+        if now_ns < self.last_ns:
+            self.invalidate()
+        if now_ns > self.last_ns:
+            self.last_progress = self.clock()
+        self.last_ns = now_ns
+        if self.reset:
+            return 'reset_restart_required'
+        if now_ns <= 0:
+            return 'waiting_for_clock'
+        if self.clock()-self.last_progress >= self.stall_s:
+            return 'paused_or_stalled'
+        return 'running'
+
+
 class PendingPair:
     """Keep one TF-waiting pair and one newest replacement, never a FIFO.
 
@@ -481,7 +513,7 @@ def require_compressed_transport(robot):
 
 
 def pair_timing(depth_stamp_ns, received_wall_ns, received_monotonic, now_monotonic, max_age_s,
-                tf_wait_budget_s=None):
+                tf_wait_budget_s=None, current_clock_ns=None):
     """Distinguish acquisition/transport header age from adapter TF waiting.
 
     Header age at receipt includes transport latency AND possible clock offset;
@@ -498,8 +530,11 @@ def pair_timing(depth_stamp_ns, received_wall_ns, received_monotonic, now_monoto
         status = 'timestamped_tf_wait_expired'
     else:
         status = 'within_latency_budget'
+    # A slow/paused simulation second is not a wall second. Keep the source
+    # age in its own clock while enforcing the wall-time TF waiting budget.
+    age = arrival+wait if current_clock_ns is None else (int(current_clock_ns)-int(depth_stamp_ns))/1e9
     return dict(timing_status=status, selected_frame_age_at_receipt_s=arrival,
-                pending_wait_s=wait, selected_frame_age_s=arrival+wait)
+                pending_wait_s=wait, selected_frame_age_s=age)
 
 
 def cached_rgbd(metadata, prepare):
@@ -672,9 +707,11 @@ def run_adapter(robot, settings, output, health_output, stop_event, relay_passwo
     require_compressed_transport(robot)
     import rclpy
     from rclpy.context import Context
+    from rclpy.clock import Clock, ClockType, JumpThreshold
     from rclpy.duration import Duration
     from rclpy.time import Time
     from rclpy.node import Node
+    from rclpy.parameter import Parameter
     from rclpy.executors import SingleThreadedExecutor
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import CompressedImage, CameraInfo
@@ -683,10 +720,16 @@ def run_adapter(robot, settings, output, health_output, stop_event, relay_passwo
 
     context = Context()
     rclpy.init(args=[], context=context, domain_id=int(robot["domain"]))
-    node = Node(f"crossmaps_input_{robot['id']}", context=context)
+    simulation = settings.get('use_sim_time', False)
+    if simulation and robot.get('camera_relay', {}).get('mode', 'off') != 'off':
+        raise ValueError('Simulation inputs must not use a hardware SSH relay')
+    node = Node(f"crossmaps_input_{robot['id']}", context=context,
+                parameter_overrides=[Parameter('use_sim_time', value=simulation)])
+    steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
+    simulation_clock = SimulationClockState() if simulation else None
     # Defer paired-frame preparation to a timer so TF can arrive before lookup.
     # Never block this executor in a TF wait or substitute a latest transform.
-    buffer = tf2_ros.Buffer(cache_time=Duration(seconds=15))
+    buffer = tf2_ros.Buffer(cache_time=Duration(seconds=15), **({'node': node} if simulation else {}))
     listener = tf2_ros.TransformListener(buffer, node, spin_thread=False)
     calibration = {}
     state = dict(robot_id=robot["id"], domain=robot["domain"], session_id=str(uuid.uuid4()),
@@ -706,10 +749,49 @@ def run_adapter(robot, settings, output, health_output, stop_event, relay_passwo
     qos = qos_profile_sensor_data
     qos.depth = int(settings["qos_depth"])
 
+    def clock_health():
+        if not simulation:
+            return {'clock_mode': 'wall'}
+        now_ns = node.get_clock().now().nanoseconds
+        status = simulation_clock.observe(now_ns)
+        result = dict(clock_mode='simulation', simulation_clock_status=status,
+                      simulation_clock_ns=now_ns,
+                      simulation_clock_idle_s=max(0., time.monotonic()-simulation_clock.last_progress))
+        if status != 'running':
+            messages = {
+                'waiting_for_clock': 'Waiting for a nonzero simulation /clock before accepting camera frames.',
+                'paused_or_stalled': 'Simulation clock is not advancing: resume Gazebo or check its /clock publisher.',
+                'reset_restart_required': 'Simulation clock moved backwards. Restart the CrossMaps simulation session before continuing.',
+            }
+            result.update(status='simulation_'+status, last_error=messages[status])
+        return result
+
+    def clock_ready():
+        report = clock_health()
+        state.update({k: v for k, v in report.items() if k not in ('status', 'last_error')})
+        if simulation and report['simulation_clock_status'] != 'running':
+            pending.clear()
+            state.update(status=report['status'], last_error=report['last_error'])
+            return False
+        return True
+
+    # Catch every negative /clock jump, including a reset between timer polls.
+    # This runs in the same executor as image handling. Never recover silently:
+    # the old local odometry origin and map evidence must remain separate.
+    def clock_jump(_jump):
+        simulation_clock.invalidate()
+        pending.clear()
+        buffer.clear()
+    jump_handle = (node.get_clock().create_jump_callback(
+        JumpThreshold(min_forward=None, min_backward=Duration(nanoseconds=-1), on_clock_change=False),
+        post_callback=clock_jump) if simulation else None)
+
     def image_seen(msg, kind, allow_reordering=True):
         now = time.monotonic()
         stamp = stamp_ns(msg.header.stamp)
         state[f"last_{kind}_monotonic"] = now
+        if not clock_ready():
+            return False
         arrival_age = (node.get_clock().now().nanoseconds-stamp)/1e9
         state[f'{kind}_header_age_at_receipt_s'] = arrival_age
         progress = watchdog.streams[kind].observe(stamp, arrival_age)
@@ -778,7 +860,8 @@ def run_adapter(robot, settings, output, health_output, stop_event, relay_passwo
             if abs(rgb_stamp-depth_stamp) > settings["sync_slop_s"]*1e9:
                 raise ValueError("RGB/depth timestamp skew exceeds configured tolerance")
             timing = pair_timing(depth_stamp, metadata['received_wall_ns'], received, now, settings['max_age_s'],
-                                 tf_wait_budget)
+                                 tf_wait_budget, node.get_clock().now().nanoseconds if simulation else None)
+            timing['clock_mode'] = 'simulation' if simulation else 'wall'
             state.update(timing)
             # Backward-compatible field now correctly means immutable arrival age.
             state['sensor_clock_age_s'] = timing['selected_frame_age_at_receipt_s']
@@ -881,10 +964,14 @@ def run_adapter(robot, settings, output, health_output, stop_event, relay_passwo
             return False
 
     def receive_pair(rgb_msg, depth_msg):
+        if not clock_ready():
+            return
         state['received'] += 1
         pending.offer(rgb_msg, depth_msg, dict(received_wall_ns=node.get_clock().now().nanoseconds))
 
     def process_pending():
+        if not clock_ready():
+            return
         path.poll()
         # Don't pin a pair during rate limiting: choose the freshest pair when
         # capacity is available, then retain it only while TF catches up.
@@ -934,16 +1021,19 @@ def run_adapter(robot, settings, output, health_output, stop_event, relay_passwo
     path.start()
 
     def report_health():
-        if path.relay is None or path.dds_live:
+        clock_report = clock_health()
+        if clock_report.get('simulation_clock_status', 'running') == 'running' and (path.relay is None or path.dds_live):
             writers = {k: compressed_writer_ids(node, robot[k+'_topic']) for k in ('rgb','depth')}
             path.watch(watchdog, writers, state.get('tf_wait_expired', 0), state.get('last_packet_monotonic'))
         # Input health takes priority over a now-irrelevant cached TF error.
         health = watchdog.health()
         if path.relay is not None and any(s.awaiting for s in watchdog.streams.values()):
             health.update(status='waiting_for_camera_relay', last_error='Waiting for fresh synchronized compressed relay images')
-        latest_put(health_output, {**state, **health, **path.health(), 'reported_monotonic': time.monotonic()})
-    prepare_timer = node.create_timer(max(.01, min(.05, float(settings['tf_timeout_s']) or .05)), process_pending)
-    timer = node.create_timer(1., report_health)
+        latest_put(health_output, {**state, **health, **path.health(), **clock_report, 'reported_monotonic': time.monotonic()})
+    # ROS-time timers freeze with Gazebo; health and expiry must not freeze.
+    prepare_timer = node.create_timer(max(.01, min(.05, float(settings['tf_timeout_s']) or .05)), process_pending,
+                                     clock=steady_clock)
+    timer = node.create_timer(1., report_health, clock=steady_clock)
     executor = SingleThreadedExecutor(context=context)
     executor.add_node(node)
     try:

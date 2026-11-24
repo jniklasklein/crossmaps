@@ -1,0 +1,44 @@
+{
+  "upstream_repository": "https://github.com/waveshareteam/ugv_ws",
+  "branch": "ros2-humble-develop",
+  "revision_inspected": "f0b3ad9c16e7acb6d6145f261116d71bf6338f4a",
+  "classic_model_path": "src/ugv_main/ugv_gazebo/models/ugv_rover/model.sdf",
+  "classic_model_sha256": "44cd69cb7c37b1e8176c06501e4d2138c8c98df9853661759026934a1b1b2ffa",
+  "description_urdf_path": "src/ugv_main/ugv_description/urdf/ugv_rover.urdf",
+  "description_urdf_sha256": "e9e954288e924f01f01980212459e48422011e864bb7e099af37c6316175c0f0",
+  "local_description_comparison": "All local URDF link and joint element tags/attributes match the pinned upstream description semantically. Byte hashes differ from formatting/comments. Base-link and left-front-wheel STL bytes match upstream exactly. Imported local file SHA256 values are recorded separately in vendor/waveshare_ugv/provenance.json.",
+  "classic_drive": {
+    "plugin": "libgazebo_ros_diff_drive.so",
+    "driven_wheel_pairs": 2,
+    "wheel_separation_m": 0.175,
+    "wheel_diameter_m": 0.05,
+    "max_wheel_torque": 20,
+    "max_wheel_acceleration": 1.0,
+    "explicit_friction_parameters": false
+  },
+  "native_drive": {
+    "plugin": "gz::sim::systems::DiffDrive",
+    "driven_wheel_pairs": 2,
+    "passive_middle_contact_wheels": 2,
+    "wheel_separation_m": 0.17452,
+    "wheel_diameter_m": 0.08,
+    "rationale": "Use actual CAD axle spacing and STL tire radius, not the conflicting Classic plugin diameter. Vendor ugv_base_general/General_Driver/ugv_config.h also specifies UGV Rover WHEEL_D=0.0800 and nominal TRACK_WIDTH=0.172. Effective skid-steer track needs physical calibration. Friction and velocity limits are conservative simulation settings, not calibrated motor behavior."
+  },
+  "classic_sensors": {
+    "depth_camera": {"width": 640, "height": 480, "horizontal_fov_rad": 1.02974, "hz": 30, "near_m": 0.02, "far_m": 300, "camera_noise_stddev": 0.007},
+    "imu": {"hz": 20, "angular_velocity_noise_stddev": 0.0002, "linear_acceleration_noise_stddev": 0.017},
+    "lidar": {"hz": 10, "samples": 360, "min_range_m": 0.16, "max_range_m": 3.5, "noise_stddev": 0.01}
+  },
+  "native_sensors": {
+    "rgbd": "640x360 at 3Hz default, explicit per-rover real-recording rectified intrinsics and optical TF, ideal registered depth. Rate is adjustable. This is not the original Classic camera profile, a stereo-camera failure model, or a full IMU/LiDAR simulation.",
+    "calibration_file": "rover_calibration.json"
+  },
+  "official_vm_inspection": {
+    "source": "/Users/niklasklein/Downloads/ws_0924",
+    "format": "VMware split sparse VMDK, 21 extents, approximately 26GiB allocated and 80GiB logical",
+    "guest": "Ubuntu 22.04.5 LTS, x86-64, 2vCPU, 4GiB RAM",
+    "compatibility": "Cannot hardware-virtualize this x86-64 guest directly on Apple Silicon; running it would require CPU emulation. ARM Ubuntu is a separate rebuild, not this image.",
+    "inspection": "Read descriptor/VM configuration and filenames only; no VM boot, no writable disk mount, no image modifications."
+  },
+  "scope": "Native Gazebo Harmonic port of the real CAD description plus recorded camera calibration, targeting CrossMaps algorithm tests. Does not claim bit-identical reproduction of the vendor Ubuntu VM, Classic plugins, Docker SLAM stack, hardware drivers, camera failures, or real-world traction."
+}

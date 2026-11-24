@@ -1,0 +1,185 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: nav2_rviz_plugins/Navigation 2
+    Name: Navigation 2
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Metre grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 20
+      Color: 65; 80; 94
+      Alpha: 0.35
+      Reference Frame: <Fixed Frame>
+      Line Style:
+        Value: Lines
+        Line Width: 0.015
+    - Class: rviz_default_plugins/Map
+      Name: Laser SLAM map
+      Enabled: true
+      Alpha: 0.90
+      Color Scheme: map
+      Draw Behind: true
+      Topic:
+        Value: /map
+        Depth: 1
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+      Update Topic:
+        Value: /map_updates
+        Depth: 1
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+    - Class: rviz_default_plugins/Map
+      Name: Local obstacle clearance
+      Enabled: true
+      Alpha: 0.35
+      Color Scheme: costmap
+      Draw Behind: false
+      Topic:
+        Value: /local_costmap/costmap
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+      Update Topic:
+        Value: /local_costmap/costmap_updates
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+    - Class: rviz_default_plugins/LaserScan
+      Name: Live laser scan
+      Enabled: true
+      Topic:
+        Value: /scan
+        Depth: 5
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+      Color: 65; 205; 195
+      Color Transformer: FlatColor
+      Position Transformer: XYZ
+      Size (Pixels): 3
+      Size (m): 0.025
+      Style: Flat Squares
+      Decay Time: 0
+      Use Fixed Frame: true
+    - Class: rviz_default_plugins/Path
+      Name: Planned global route
+      Enabled: true
+      Topic:
+        Value: /plan
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+      Color: 190; 145; 255
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.035
+      Buffer Length: 1
+      Pose Style: None
+      Offset: {X: 0, Y: 0, Z: 0.03}
+    - Class: rviz_default_plugins/Path
+      Name: Local controller route
+      Enabled: true
+      Topic:
+        Value: /local_plan
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+      Color: 255; 180; 65
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.025
+      Buffer Length: 1
+      Pose Style: None
+      Offset: {X: 0, Y: 0, Z: 0.04}
+    - Class: rviz_default_plugins/Polygon
+      Name: Rover collision footprint
+      Enabled: true
+      Topic:
+        Value: /local_costmap/published_footprint
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+      Color: 55; 225; 150
+      Alpha: 1
+    - Class: rviz_default_plugins/Odometry
+      Name: Rover heading and recent wheel path
+      Enabled: true
+      Topic:
+        Value: /odom
+        Depth: 10
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+      Keep: 80
+      Position Tolerance: 0.04
+      Angle Tolerance: 0.10
+      Shape: Arrow
+      Color: 235; 95; 70
+      Alpha: 0.9
+      Shaft Length: 0.18
+      Shaft Radius: 0.015
+      Head Length: 0.09
+      Head Radius: 0.035
+      Covariance:
+        Value: false
+    - Class: rviz_default_plugins/TF
+      Name: Current rover axes
+      Enabled: true
+      Frames:
+        All Enabled: false
+        base_footprint: {Value: true}
+      Show Arrows: false
+      Show Axes: true
+      Show Names: false
+      Marker Scale: 0.25
+      Frame Timeout: 5
+  Enabled: true
+  Global Options:
+    Background Color: 16; 23; 31
+    Fixed Frame: map
+    Frame Rate: 20
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+    - Class: nav2_rviz_plugins/GoalTool
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Map view
+      Angle: -1.5708
+      Scale: 90
+      X: 0.7
+      Y: 0
+      Target Frame: <Fixed Frame>
+      Near Clip Distance: 0.01
+      Invert Z Axis: false
+Window Geometry:
+  Width: 1200
+  Height: 850
+  X: 100
+  Y: 80
+  Hide Left Dock: false
+  Hide Right Dock: true

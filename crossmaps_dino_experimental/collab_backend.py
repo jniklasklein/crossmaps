@@ -9,9 +9,11 @@ from __future__ import annotations
 from collections import deque
 from pathlib import Path
 import hashlib
+import io
 import json
 import math
 import os
+import stat
 import time
 
 import cv2
@@ -33,7 +35,8 @@ TRAIL_GAP_NS = 10_000_000_000
 
 DEFAULTS = dict(shadow_mode=True, provisional_enabled=True, keyframe_seconds=8., keyframe_translation=.15,
                 keyframe_rotation_deg=8., submap_translation=1., submap_rotation_deg=20.,
-                submap_seconds=90., submap_keyframes=10, max_keyframes=256, max_submaps=64,
+                submap_seconds=90., submap_keyframes=10, stationary_bootstrap_keyframes=6,
+                max_keyframes=256, max_submaps=64,
                 max_store_bytes=2*1024**3, keyframe_points=2400, submap_points=5000,
                 snapshot_points=16000, candidate_top_k=3, verifications_per_keyframe=2,
                 min_visual_inliers=12, min_overlap=.25, max_registration_rmse=.065,
@@ -83,7 +86,8 @@ def validate_config(config):
     for key in ('shadow_mode', 'provisional_enabled'):
         if type(values[key]) is not bool:
             raise ValueError(f'{key} must be a JSON boolean')
-    integers = dict(submap_keyframes=(1, 64), max_keyframes=(1, 512), max_submaps=(1, 256),
+    integers = dict(submap_keyframes=(1, 64), stationary_bootstrap_keyframes=(1, 32),
+                    max_keyframes=(1, 512), max_submaps=(1, 256),
                     max_store_bytes=(1024, 64*1024**3), keyframe_points=(12, 10000),
                     submap_points=(12, 20000), snapshot_points=(32, 100000), candidate_top_k=(1, 10),
                     verifications_per_keyframe=(0, 10), min_visual_inliers=(6, 200), max_entities=(1, 512))
@@ -111,10 +115,13 @@ class Backend:
     anchors or pretending an evicted trajectory is still reconstructible. Local
     preview/perception may continue; the dashboard exposes capacity_reached.
     """
-    def __init__(self, config=None, store_dir=None):
+    def __init__(self, config=None, store_dir=None, evidence_budget=None):
         self._overrides = dict(config or {})
         self.config = validate_config(config or {})
         self.store_dir = Path(store_dir).resolve() if store_dir else None
+        # Optional run-wide disk/free-space admission guard. It must not mutate
+        # the graph and is called with the exact prospective compressed size.
+        self.evidence_budget = evidence_budget
         self.revision = 0
         self.sessions = {}
         self.robots = {}
@@ -139,6 +146,24 @@ class Backend:
         if self.store_dir:
             self.store_dir.mkdir(parents=True, exist_ok=True)
             self._restore()
+            # A crash after a frame write but before the state checkpoint can
+            # leave an unreferenced payload. Preserve it, but do not let it
+            # disappear from the next run's byte-budget accounting.
+            self.store_bytes = self._stored_payload_bytes()
+
+    def _stored_payload_bytes(self):
+        total = 0
+        for path in self.store_dir.iterdir():
+            name = path.name.removesuffix('.tmp')
+            key = name[len('frame-'):-len('.npz')]
+            if not (name.startswith('frame-') and name.endswith('.npz')
+                    and len(key) == 20 and all(c in '0123456789abcdef' for c in key)):
+                continue
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError('Stored frame payload must be a regular, non-linked file')
+            total += info.st_size
+        return total
 
     def _event(self, kind, message, **details):
         self.events.append(dict(time=time.time(), kind=kind, message=message, **plain(details)))
@@ -226,6 +251,111 @@ class Backend:
         frame['_surface_features'] = matrix
         gray = cv2.resize(cv2.cvtColor(frame['rgb'], cv2.COLOR_BGR2GRAY), (64, 48)).astype(np.float32)
         frame['_view_thumbnail'] = (gray-float(gray.mean()))/max(10., float(gray.std()))
+        depth = cv2.resize(frame['depth'], (64, 48), interpolation=cv2.INTER_NEAREST)
+        frame['_depth_thumbnail'] = depth
+        # Low-pass before focus scoring prevents single-pixel sensor noise from
+        # masquerading as recovered scene detail. Contrast normalization makes
+        # exposure-only differences uninteresting.
+        gray = cv2.resize(cv2.cvtColor(frame['rgb'], cv2.COLOR_BGR2GRAY), (320, 240)).astype(np.float32)
+        gray = cv2.GaussianBlur(gray, (3, 3), .8)
+        lap = cv2.Laplacian(gray, cv2.CV_32F)
+        tiles = [float(np.var(lap[y:y+60, x:x+80])) / max(100., float(np.var(gray[y:y+60, x:x+80])))
+                 for y in range(0, 240, 60) for x in range(0, 320, 80)]
+        focus = float(np.median(tiles))
+        frame['_retention_quality'] = dict(
+            depth_coverage=float(np.mean(np.isfinite(frame['depth']) & (frame['depth'] > 0))),
+            focus=focus, focus_level=int(np.clip(math.floor(math.log2(max(.02, focus)/.02)), 0, 8)),
+            focus_tiles=tiles)
+
+    @staticmethod
+    def _quality_improvement(obs, nearby):
+        if not nearby:
+            return None
+        quality = obs['_retention_quality']
+        previous = [frame['_retention_quality'] for frame in nearby]
+        best_coverage = max(item['depth_coverage'] for item in previous)
+        if quality['depth_coverage'] >= best_coverage + .05 - 1e-9:
+            return 'depth_coverage_improved'
+        # Equal overall coverage may still expose previously unmeasured parts
+        # of the scene. Compare with the union, so alternating dropout masks
+        # cannot endlessly manufacture "new" support.
+        depth = obs['_depth_thumbnail']
+        valid = np.isfinite(depth) & (depth > 0)
+        previously_measured = np.logical_or.reduce([
+            np.isfinite(frame['_depth_thumbnail']) & (frame['_depth_thumbnail'] > 0) for frame in nearby])
+        if float(np.mean(valid & ~previously_measured)) >= .05:
+            return 'depth_support_improved'
+        best_focus = max(item['focus'] for item in previous)
+        best_tiles = np.max([item['focus_tiles'] for item in previous], axis=0)
+        current_tiles = np.asarray(quality['focus_tiles'])
+        better_tiles = (current_tiles >= 1.75*best_tiles) & (current_tiles >= best_tiles + .02)
+        if (quality['depth_coverage'] >= best_coverage - .02
+                and quality['focus_level'] > max(item['focus_level'] for item in previous)
+                and quality['focus'] >= max(best_focus*1.75, best_focus+.02)
+                and float(np.mean(better_tiles)) >= .5):
+            return 'image_detail_improved'
+        return None
+
+    @staticmethod
+    def _same_retention_view(first, second):
+        """Ignore exposure/noise; retain broad appearance or measured-depth change.
+
+        This is an admission heuristic, never a geometric verification or an
+        independent-view vote. Small moving objects must not fill the store.
+        """
+        image_delta = np.abs(first['_view_thumbnail'] - second['_view_thumbnail'])
+        image_changed = float(image_delta.mean()) >= .20 and float(np.mean(image_delta >= .30)) >= .20
+        a, b = first['_depth_thumbnail'], second['_depth_thumbnail']
+        valid_a, valid_b = np.isfinite(a) & (a > 0), np.isfinite(b) & (b > 0)
+        common = valid_a & valid_b
+        # Missing measurements alone are not new geometry.
+        changed = common & (np.abs(a-b) >= np.maximum(.08, .04*np.minimum(a, b)))
+        depth_changed = int(common.sum()) >= 48 and float(changed.mean()) >= .15
+        return not (image_changed or depth_changed)
+
+    def _retention_decision(self, source, obs, last):
+        if last is None:
+            return True, 'first_capture'
+        same_space = all(last[key] == obs[key] for key in ('calibration_id', 'feature_space_id'))
+        if not same_space:
+            return True, 'calibration_or_feature_space_changed'
+        distance, angle = pose_delta(last['T_local_camera'], obs['T_local_camera'])
+        if distance >= self.config['keyframe_translation'] or angle >= math.radians(self.config['keyframe_rotation_deg']):
+            return True, 'viewpoint_changed'
+        nearby = []
+        for key in source['keyframe_ids']:
+            frame = self.keyframes[key]
+            if any(frame[name] != obs[name] for name in ('calibration_id', 'feature_space_id')):
+                continue
+            distance, angle = pose_delta(frame['T_local_camera'], obs['T_local_camera'])
+            if distance < self.config['keyframe_translation'] and angle < math.radians(self.config['keyframe_rotation_deg']):
+                nearby.append(frame)
+        improvement = self._quality_improvement(obs, nearby)
+        if improvement:
+            return True, improvement
+        elapsed = (obs['stamp_ns']-last['stamp_ns'])/1e9
+        if elapsed < self.config['keyframe_seconds']:
+            return False, 'capture_interval'
+        if len(nearby) < self.config['stationary_bootstrap_keyframes']:
+            return True, 'stationary_bootstrap'
+        if any(self._same_retention_view(frame, obs) for frame in nearby):
+            return False, 'redundant_view'
+        return True, 'rgbd_changed'
+
+    def _evidence_outcome(self, source, outcome, reason, **details):
+        evidence = source.setdefault('evidence', dict(counts={}))
+        counts = evidence.setdefault('counts', {})
+        counts[outcome] = counts.get(outcome, 0) + 1
+        evidence.update(outcome=outcome, reason=reason, seq=source['last_seq'],
+                        stamp_ns=source['last_stamp_ns'], **details)
+
+    def _capacity_reached(self, source, reason, code):
+        self.capacity_reason = reason
+        source['status'] = 'capacity_reached'
+        self._evidence_outcome(source, 'capacity_reached', code)
+        self.mark_trajectory_gap(source['robot_id'], source['session_id'])
+        self.revision += 1
+        return self.snapshot()
 
     def _distinct_views(self, a, b):
         distance, angle = pose_delta(a['T_local_camera'], b['T_local_camera'])
@@ -310,25 +440,21 @@ class Backend:
         if not obs.get('integration_allowed', True):
             source['status'] = 'pose_inconsistent'
             source['rejected_poses'] += 1
+            self._evidence_outcome(source, 'pose_rejected', 'pose_check')
             self.mark_trajectory_gap(robot, session)
             self._event('pose_rejected', f'{robot}: observation excluded from mapping', pose_quality=source['pose_quality'])
             self.revision += 1
             return self.snapshot()
         source['status'] = 'observing'
         last = self.keyframes.get(source['keyframe_ids'][-1]) if source['keyframe_ids'] else None
-        if last is not None:
-            distance, angle = pose_delta(last['T_local_camera'], obs['T_local_camera'])
-            elapsed = (obs['stamp_ns']-last['stamp_ns'])/1e9
-            same_calibration = last['calibration_id'] == obs['calibration_id']
-            if same_calibration and elapsed < self.config['keyframe_seconds'] and distance < self.config['keyframe_translation'] and angle < math.radians(self.config['keyframe_rotation_deg']):
-                self._record_trajectory_pose(source, obs, last)
-                self.revision += 1
-                return self.snapshot()
-        if len(self.keyframes) >= self.config['max_keyframes'] or self.store_bytes >= self.config['max_store_bytes']:
-            self.capacity_reason = 'Retained evidence capacity reached; increase limits or start a new run. Existing evidence preserved.'
-            source['status'] = 'capacity_reached'
-            self.mark_trajectory_gap(robot, session)
+        retain, retention_reason = self._retention_decision(source, obs, last)
+        if not retain:
+            self._record_trajectory_pose(source, obs, last)
+            self._evidence_outcome(source, 'redundant' if retention_reason == 'redundant_view' else 'interval_skipped', retention_reason)
+            self.revision += 1
             return self.snapshot()
+        if len(self.keyframes) >= self.config['max_keyframes']:
+            return self._capacity_reached(source, 'Retained keyframe capacity reached; existing evidence preserved.', 'max_keyframes')
         submap = self.submaps.get(source['submap_ids'][-1]) if source['submap_ids'] else None
         new_submap = submap is None
         if submap:
@@ -336,15 +462,31 @@ class Backend:
             age = (obs['stamp_ns']-submap['start_stamp_ns'])/1e9
             new_submap = (distance >= self.config['submap_translation'] or angle >= math.radians(self.config['submap_rotation_deg'])
                           or age >= self.config['submap_seconds'] or len(submap['keyframe_ids']) >= self.config['submap_keyframes']
-                          or submap['calibration_id'] != obs['calibration_id'])
+                          or submap['calibration_id'] != obs['calibration_id']
+                          or (last is not None and last['feature_space_id'] != obs['feature_space_id']))
         if new_submap:
             if len(self.submaps) >= self.config['max_submaps']:
-                self.capacity_reason = 'Submap capacity reached; existing graph preserved. Start a new run or increase max_submaps.'
-                source['status'] = 'capacity_reached'
-                self.mark_trajectory_gap(robot, session)
-                return self.snapshot()
+                return self._capacity_reached(source, 'Submap limit reached; existing graph preserved.', 'max_submaps')
+        # Prepare the exact payload before changing any graph/evidence state.
+        # A too-large frame must never sneak past the byte limit by one frame.
+        submap_id = (identifier('submap', robot, session, len(source['submap_ids']))
+                     if new_submap else submap['id'])
+        obs['id'] = identifier('keyframe', robot, session, obs['seq'])
+        obs['source_id'], obs['submap_id'] = source_id, submap_id
+        payload = self._encode_frame(obs)
+        if self.store_bytes + len(payload) > self.config['max_store_bytes']:
+            return self._capacity_reached(source, 'Retained evidence byte limit would be exceeded; existing evidence preserved.', 'max_store_bytes')
+        if self.evidence_budget is not None:
+            allowed, reason = self.evidence_budget(len(payload))
+            if not allowed:
+                return self._capacity_reached(source, str(reason), 'external_storage_budget')
+        # Write before publishing the corresponding graph mutation. I/O failures
+        # leave the in-memory graph unchanged (a recoverable orphan frame is safer
+        # than a checkpoint referencing an unwritten frame).
+        self._persist_frame(obs, payload)
+        self.store_bytes += len(payload)
+        if new_submap:
             previous = submap
-            submap_id = identifier('submap', robot, session, len(source['submap_ids']))
             submap = dict(id=submap_id, source_id=source_id, robot_id=robot, session_id=session,
                           start_stamp_ns=obs['stamp_ns'], calibration_id=obs['calibration_id'], keyframe_ids=[],
                           T_local_submap=obs['T_local_camera'].copy(), T_world_submap=obs['T_local_camera'].copy(),
@@ -362,12 +504,14 @@ class Backend:
                     corroborations=0)
             self.submaps[submap_id] = submap
             source['submap_ids'].append(submap_id)
-        obs['id'] = identifier('keyframe', robot, session, obs['seq'])
-        obs['source_id'], obs['submap_id'] = source_id, submap['id']
         obs['T_submap_camera'] = np.linalg.inv(submap['T_local_submap']) @ obs['T_local_camera']
         self.keyframes[obs['id']] = obs
         source['keyframe_ids'].append(obs['id'])
         submap['keyframe_ids'].append(obs['id'])
+        self._evidence_outcome(source, 'retained', retention_reason,
+                               last_retained_stamp_ns=obs['stamp_ns'],
+                               last_retained_received_monotonic=obs.get('received_monotonic'),
+                               last_retained_unix=time.time())
         self._record_trajectory_pose(source, obs, obs)
         self._rebuild_submap(submap)
         self._retrieve(obs)
@@ -375,7 +519,6 @@ class Backend:
         self._optimize()
         self._update_entities()
         self.revision += 1
-        self._persist_frame(obs)
         self._persist_state()
         return self.snapshot()
 
@@ -909,6 +1052,8 @@ class Backend:
                                  'provisional' if source_id in preview else 'unaligned'),
                 last_stamp_ns=source['last_stamp_ns'],
                 last_received=source.get('last_received'), pose_quality=source.get('pose_quality'), rejected_poses=source['rejected_poses'],
+                evidence=dict(source.get('evidence', {}), retained=len(source['keyframe_ids']),
+                              last_retained_stamp_ns=latest_frame['stamp_ns'] if latest_frame else None),
                 trajectory=self._trajectory_snapshot(source),
                 T_world_camera=world_camera,
                 T_world_local=(world_camera @ np.linalg.inv(latest_frame['T_local_camera'])) if world_camera is not None else None))
@@ -949,6 +1094,14 @@ class Backend:
             pending_anchors=self.pending_anchors, events=list(self.events),
             stats=dict(keyframes=len(self.keyframes), submaps=len(self.submaps), sessions=len(self.sessions),
                        store_bytes=self.store_bytes, capacity_reason=self.capacity_reason, graph=self.graph_status,
+                       limits={name: self.config[name] for name in ('max_keyframes', 'max_submaps', 'max_store_bytes')},
+                       evidence_capacity=dict(
+                           used=dict(keyframes=len(self.keyframes), submaps=len(self.submaps), store_bytes=self.store_bytes),
+                           limits={name: self.config[name] for name in ('max_keyframes', 'max_submaps', 'max_store_bytes')},
+                           stationary_bootstrap_keyframes=self.config['stationary_bootstrap_keyframes'],
+                           blocked_sources=sum(s.get('status') == 'capacity_reached' for s in self.sessions.values()),
+                           counters={name: sum(s.get('evidence', {}).get('counts', {}).get(name, 0) for s in self.sessions.values())
+                                     for name in ('retained', 'redundant', 'interval_skipped', 'pose_rejected', 'capacity_reached')}),
                        verification_scheduler=self.verification_schedule.report(),
                        accepted_loops=sum(edge['kind']=='loop' and edge['active'] for edge in self.constraints.values()),
                 entity_links=sum(link.get('active', False) and link.get('alignment_valid', False) and link.get('compatible_current', False) for link in self.entity_links.values())),
@@ -959,9 +1112,8 @@ class Backend:
                            geometry_rebuilt_from_original_camera_support=True,
                            T_world_local_is_latest_pose_diagnostic_not_rigid_map_transform=True)))
 
-    def _persist_frame(self, frame):
-        if not self.store_dir:
-            return
+    @staticmethod
+    def _encode_frame(frame):
         metadata = {key: frame[key] for key in ('id', 'source_id', 'submap_id', 'robot_id', 'session_id',
                     'seq', 'stamp_ns', 'rgb_stamp_ns', 'received_monotonic', 'calibration_id', 'feature_space_id', 'pose_quality') if key in frame}
         arrays = {key: frame[key] for key in ('rgb', 'depth', 'K', 'T_local_camera', 'points_camera', 'colors')}
@@ -975,13 +1127,29 @@ class Backend:
             for key in ('points_camera', 'dino', 'clip'):
                 arrays[f's{index}_{key}'] = np.asarray(surface[key] if surface[key] is not None else [], dtype=np.float32)
         arrays['metadata'] = np.asarray(json.dumps(plain(metadata), allow_nan=False))
+        stream = io.BytesIO()
+        np.savez_compressed(stream, **arrays)
+        return stream.getvalue()
+
+    def _persist_frame(self, frame, payload):
+        if not self.store_dir:
+            return
         destination = self.store_dir/f"frame-{frame['id']}.npz"
         temporary = destination.with_suffix('.npz.tmp')
-        with temporary.open('wb') as stream:
-            np.savez_compressed(stream, **arrays)
-            stream.flush(); os.fsync(stream.fileno())
-        os.replace(temporary, destination)
-        self.store_bytes += destination.stat().st_size
+        try:
+            with temporary.open('wb') as stream:
+                stream.write(payload)
+                stream.flush(); os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+        except BaseException:
+            # Only this exact unfinished write is disposable; never remove a
+            # committed frame or a prior run's unreferenced evidence.
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                # If cleanup itself fails, retain/account for the partial file.
+                self.store_bytes = self._stored_payload_bytes()
+            raise
 
     def _persist_state(self):
         if not self.store_dir:

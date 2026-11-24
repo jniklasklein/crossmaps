@@ -35,7 +35,8 @@ class AdapterRosSmokeTests(unittest.TestCase):
         self.channels = []
         self.config = validate_config({"central_domain": 88, "robots": [
             {"id": "smoke_a", "domain": 86, "base_frame": "base_link"}, {"id": "smoke_b", "domain": 87}],
-            "input": {"max_hz": 10., "max_age_s": 2., "tf_timeout_s": .3}})
+            "input": {"max_hz": 10., "max_age_s": 2., "tf_timeout_s": .3,
+                      "use_sim_time": self._testMethodName.startswith('test_simulation_')}})
         self.mp = multiprocessing.get_context("spawn")
         self.addCleanup(self._cleanup)
         for robot in self.config["robots"]:
@@ -146,9 +147,9 @@ class AdapterRosSmokeTests(unittest.TestCase):
          msg.transform.translation.z) = map(float, translation)
         return msg
 
-    def _pair(self, source, color, depth_m, pose, delayed_tf=False, omit_tf=False):
+    def _pair(self, source, color, depth_m, pose, delayed_tf=False, omit_tf=False, now_ns=None):
         from sensor_msgs.msg import CompressedImage
-        now_ns = source.node.get_clock().now().nanoseconds
+        now_ns = source.node.get_clock().now().nanoseconds if now_ns is None else now_ns
         image_stamp = self._stamp(now_ns - 100_000_000)
         latest_stamp = self._stamp(now_ns)
         rgb = CompressedImage()
@@ -310,6 +311,43 @@ class AdapterRosSmokeTests(unittest.TestCase):
         self.assertEqual(second['session_id'], first['session_id'])
         self.assertGreater(second['seq'], first['seq'])
         self._wait(lambda: self._health().get(source.robot['id'], {}).get('rgb_reader_recoveries') == 1)
+
+    def test_simulation_clock_pause_resume_and_reset(self):
+        from rosgraph_msgs.msg import Clock
+        from rclpy.qos import qos_profile_sensor_data
+        source = self.channels[0]
+        clock = source.node.create_publisher(Clock, '/clock', qos_profile_sensor_data)
+        self._wait(lambda: clock.get_subscription_count() > 0, message='simulation clock subscriber')
+        self._pair(source, (25, 50, 200), 1.2, (0., 0., 0.), now_ns=1_000_000_000)
+        self._spin_for(.2)
+        with self.assertRaises(queue.Empty):
+            source.output.get_nowait()
+        self._wait(lambda: self._health().get(source.robot['id'], {}).get('simulation_clock_status') == 'waiting_for_clock')
+
+        def set_clock(ns):
+            clock.publish(Clock(clock=self._stamp(ns)))
+            self._spin_for(.15)
+
+        set_clock(10_000_000_000)
+        stamp = self._pair(source, (25, 50, 200), 1.2, (0., 0., 0.), now_ns=10_000_000_000)
+        packet = self._packet(source)
+        self.assertEqual(packet['stamp_ns'], stamp)
+        self.assertEqual(packet['transport_timing']['clock_mode'], 'simulation')
+        self.assertAlmostEqual(packet['transport_timing']['selected_frame_age_at_receipt_s'], .1)
+        self.assertFalse(packet['preview_only'])
+        self._wait(lambda: self._health().get(source.robot['id'], {}).get('simulation_clock_status') == 'paused_or_stalled',
+                   timeout=5., message='wall-time health while /clock is paused')
+        set_clock(11_000_000_000)
+        self._pair(source, (30, 70, 210), 1.2, (.1, 0., 0.), now_ns=11_000_000_000)
+        resumed = self._packet(source)
+        self.assertEqual(resumed['session_id'], packet['session_id'])
+        self.assertGreater(resumed['seq'], packet['seq'])
+        set_clock(0)
+        set_clock(20_000_000_000)  # Must remain latched even after overtaking old clock.
+        self._pair(source, (30, 70, 210), 1.2, (.1, 0., 0.), now_ns=20_000_000_000)
+        self._wait(lambda: self._health().get(source.robot['id'], {}).get('simulation_clock_status') == 'reset_restart_required')
+        with self.assertRaises(queue.Empty):
+            source.output.get_nowait()
 
 
 if __name__ == "__main__":

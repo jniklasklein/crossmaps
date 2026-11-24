@@ -25,6 +25,20 @@ check("invalid geometry is omitted and budget bounded", () => { const large = { 
 check("missing transform is never implicitly aligned", () => { const s = { ...state, submaps: [{ ...state.submaps[0], T_world_submap: null }] }; assert.equal(buildCloud(s).positions.length, 0); });
 check("candidate actions target concrete verified constraint IDs", () => { const constraint = { id: "verified-1" }; assert.equal(candidateConstraint({ id: "candidate-1", constraint_id: "verified-1" }, { constraints: [constraint] }), constraint); assert.equal(candidateConstraint({ id: "unknown" }, { constraints: [constraint] }), undefined); });
 check("camera health derives from actual source age", () => { assert.equal(healthState({ frame_age_s: 20 }), "stale"); assert.equal(healthState({ frame_age_s: .1 }), "healthy"); assert.equal(healthState({ status: "waiting" }), "waiting"); assert.equal(healthState({ frame_age_s: 0, error: "lost" }), "error"); });
+check("simulation clock pause/reset is distinct from a dead camera", () => {
+  const { frameWarning, roverHealthCard } = require("../collab_dashboard/app.js");
+  const robot = { frame_age_s: 60, health: { clock_mode: "simulation", simulation_clock_status: "paused_or_stalled" } };
+  assert.equal(healthState(robot), "simulation_paused_or_stalled");
+  assert.match(roverHealthCard(robot).summary, /Simulation paused/);
+  assert.match(imageCaption(robot, "rgb", {available: true, age: 60}), /Gazebo paused/);
+  assert.equal(frameWarning("rgb", {connected: true, preview: true, available: true, age: 60, simulationClock: "paused_or_stalled"}), "Simulation paused or clock stopped");
+  robot.health.simulation_clock_status = "reset_restart_required";
+  assert.equal(healthState(robot), "simulation_reset_restart_required");
+  assert.match(roverHealthCard(robot).summary, /restart/);
+  assert.match(imageCaption(robot, "rgb", {available: true, age: 60}), /Previous simulation epoch/);
+  robot.status = "adapter_exited";
+  assert.equal(healthState(robot), "error");
+});
 check("historical acceptance is not current shared identity evidence", () => { assert.equal(activeEntityLink({ active: true, alignment_valid: true, compatible_current: true }), true); assert.equal(activeEntityLink({ active: true, alignment_valid: true, compatible_current: false }), false); assert.equal(activeEntityLink({ active: true, alignment_valid: false, compatible_current: true }), false); assert.equal(activeEntityLink({ active: false, alignment_valid: true, compatible_current: true }), false); });
 check("demo and replay cannot be mistaken for live observations", () => { assert.match(modePresentation({ mode: "synthetic_demo" }).label, /Synthetic demo/); assert.match(modePresentation({ mode: "recorded_replay" }).label, /Recorded replay/); assert.match(modePresentation({ mode: "live", shadow_mode: true }).label, /shadow/); });
 check("view age belongs only to that produced image", () => { const robot = { frame_age_s: 1, observation_age_s: 2, image_age_s: { rgb: 1, sam: 30 } }; assert.equal(imageAge(robot, "sam"), 30); assert.equal(imageAge(robot, "rgb"), 1); assert.equal(imageAge(robot, "entities"), null); assert.equal(imageAge({ image_age_s: { sam: null }, observation_age_s: 0 }, "sam"), null); });

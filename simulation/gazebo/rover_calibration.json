@@ -1,0 +1,26 @@
+{
+  "description": "Recorded real-rover rectified RGB calibration scaled from 1280x720 to 640x360 by 0.5. Optical extrinsics are inverse of recorded T_camera_base, not an independent physical measurement.",
+  "recording": "crossmaps_dino_experimental/.runtime/collaboration/20261120T160631Z-74ba1f/evidence",
+  "robots": {
+    "rover_a": {
+      "source_frame": "frame-1d771737474ff136e2ad.npz",
+      "K_640x360": [[452.87445068359375, 0, 323.2257385253906], [0, 452.9478759765625, 178.9544677734375], [0, 0, 1]],
+      "camera_optical": {
+        "translation": [0.06577008779165411, 6.508560202099369e-10, 0.10195299999999997],
+        "quaternion_xyzw": [-0.5, 0.5, -0.5, 0.5],
+        "frame_id": "oak_rgb_camera_optical_frame",
+        "calibration_status": "recorded_ROS_TF_not_independently_measured"
+      }
+    },
+    "rover_b": {
+      "source_frame": "frame-c2ac1988405e91834c0f.npz",
+      "K_640x360": [[457.4581298828125, 0, 325.54449462890625], [0, 457.5826416015625, 182.56993103027344], [0, 0, 1]],
+      "camera_optical": {
+        "translation": [0.06577008779165411, 6.508560202099369e-10, 0.10195299999999997],
+        "quaternion_xyzw": [-0.5, 0.5, -0.5, 0.5],
+        "frame_id": "oak_rgb_camera_optical_frame",
+        "calibration_status": "recorded_ROS_TF_not_independently_measured"
+      }
+    }
+  }
+}

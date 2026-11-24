@@ -83,7 +83,7 @@ model weights are available. Initial model loading may take time.
    constraint*: that is a manual confirmation, not a requirement for preview.
 4. To confirm automatically, leave one rover in place and move the other about
    20–30 cm while keeping the same details visible, then pause. Check that
-   **Last map integration** advances and a new keyframe is verified. An agreeing
+   **Shared evidence saved** advances and a new keyframe is verified. An agreeing
    transform from a genuinely different measured viewpoint can now activate a
    pose-graph constraint. If you only want to collect proposals, turn **Shadow
    mode on**; neither provisional placement nor automatic confirmation is enabled.
@@ -126,6 +126,10 @@ setup. Missing settings inherit validated defaults from `collab_config.py`.
 | `input.sync_slop_s` | `0.08`; maximum paired RGB/depth timestamp skew |
 | `backend.shadow_mode` | `false` for new live runs; `true` opts into review. Geometric verification and corroboration are still required in automatic mode. |
 | `backend.provisional_enabled` | `true`; permit a tentative display pose when shadow is off. Set false for a confirmed-only policy. **Show provisional** is a separate display filter. |
+| `backend.stationary_bootstrap_keyframes` | `6`; time-spaced captures per nearby pose/calibration/model region for initial matching. Subsequent near-identical parked captures do not consume retained evidence. |
+| `storage.max_total_bytes` | `4294967296` (4 GiB); aggregate recording admission budget, including measured legacy recording bytes. Not a whole-disk quota. |
+| `storage.min_free_bytes` | `1073741824` (1 GiB); free-disk reserve required before retaining more evidence. |
+| `storage.max_runs` | `10`; managed-recording count limit for new evidence admission. Nothing is automatically deleted to meet it. |
 | `pose_guard.enabled` | `true`; pauses integration on a supported pose contradiction |
 | `pose_guard.rgbd_recovery` | `true`; allows a local mapping pose to be recovered from a previously observed RGB-D view after repeated geometric and image agreement |
 | `perception.parameters` | Shared v2 model/processing defaults; robot-specific non-model settings can use `robots[].parameters` |
@@ -369,8 +373,11 @@ observations. Keyframe/submap/source-local IDs are preserved through correction.
 
 ### Dashboard interpretation
 
-- **Rover cards:** camera/processed-observation ages, mean completed cycle time,
-  keyframe/submap counts, source domain/session and pose status.
+- **Rover cards:** camera/processed-observation ages, **Shared evidence saved**
+  age, mean completed cycle time, keyframe/submap counts, source domain/session
+  and pose status. Shared evidence age advances only for a new retained
+  keyframe; it can grow normally while a parked rover processes duplicate views.
+  Local semantic fusion is separate and is reported in the card/diagnostics.
 - **Spatial view:** Combined or one rover's local frame; source coloring or
   measured RGB; orbit, pan, zoom, top view, fit and expansion. A provisional
   placement in Combined is a visual prediction, not permission to fuse objects.
@@ -435,11 +442,63 @@ the experimental collaboration runtime directory. An explicitly supplied config
 cannot silently change the sources, models, central domain or input conventions
 of a resumed run; use a fresh run for those changes.
 
-Storage and computational budgets are bounded. Default backend limits include
-256 retained keyframes, 64 submaps and a 2 GiB evidence-file budget. On reaching
-capacity the system preserves retained evidence and stops adding new keyframes;
-preview/perception can continue. Inspect the capacity message and start a new
-run or deliberately adjust limits. This is not an unlimited lifelong-map store.
+### Evidence retention and storage management
+
+The shared map retains useful observations, not every processed camera frame.
+Each nearby pose/calibration/model region first keeps up to **six time-spaced
+bootstrap captures** (the ordinary capture interval is eight simulation/source
+seconds). These allow several separate RGB-D matches while the rovers are parked;
+they do not count as independent viewpoints for confirmed alignment.
+
+After that bootstrap, elapsed time alone does not retain a near-identical view.
+The default motion thresholds (15 cm or 8°), calibration/model changes, or
+meaningful RGB/depth changes can still retain new evidence. **Better observations
+from the same pose are retained too:** at least five percentage points more valid
+depth coverage, new depth support over at least 5% of the image beyond the union
+of retained nearby views, or a substantial, broadly distributed image-detail
+improvement. Quality is compared with the best retained nearby measurements,
+not merely the last frame, so alternating blur/dropout/exposure does not repeatedly
+earn new keyframes. These are admission heuristics, not alignment verification.
+
+Default hard graph limits remain **256 retained keyframes across all rovers,
+64 submaps and 2 GiB of compressed evidence payloads**. The exact prospective
+compressed frame size is checked before graph admission. Existing graph anchors,
+identity witnesses and source observations are not silently evicted to create
+room. Cameras, perception and local semantic fusion may continue when shared
+retention is full. The dashboard shows the limiting resource and evidence counts;
+fresh local-fusion timing does not mean the shared map is still growing.
+
+The recording manager additionally checks a **4 GiB aggregate admission budget**,
+a **1 GiB free-disk reserve**, and a **ten-managed-recording limit** before retaining
+more evidence. Legacy recording bytes count toward storage usage. Active runs,
+open replays, unfamiliar files and unsafe paths are protected from cleanup.
+There is **no automatic deletion**. Starting the program normally creates a fresh
+run; old maps are not imported unless `--resume` is explicitly supplied.
+
+Use **Storage & maps** in the dashboard to inspect usage and choose an operation:
+
+- **Rebuild current map…** previews a permanent deletion of the current run's
+  retained CrossMaps evidence, alignments, identities and paths. Confirming clears
+  its local semantic maps and rebuilds from fresh camera observations; queued
+  pre-rebuild observations cannot enter the new map. Loaded neural models are
+  retained. Robot SLAM, Gazebo, Nav2, sensor publishers and odometry origins are
+  not reset.
+- **Free selected old recordings…** previews only the explicitly selected,
+  inactive recordings. Confirmation permanently removes those recordings; it
+  does not delete the current run or a recording open elsewhere.
+
+Both operations require a preview followed by explicit confirmation and are
+irreversible. Cancel leaves data unchanged. These bounded policies are not an
+unlimited lifelong-map/archive implementation.
+
+Diagnostic logs have a separate recent-tail policy for new launches: owned
+regular `.log` files are checked once per second, with **8 MiB per file and
+32 MiB per run directory** thresholds. Older diagnostic lines may be compacted;
+recent output is retained and append-mode writers continue. This is not a
+lossless log archive or a strict per-write filesystem quota. Evidence, world
+assets, unrelated files and old unmanaged simulator directories are untouched.
+The recording admission budget is **not** a bound on the entire disk, model
+weights, or all historical Gazebo-generated assets.
 
 ## Try the UI without robots
 
@@ -480,15 +539,19 @@ only shows the evidence; it never accepts the proposal.
 
 Rover status cards keep a steady height during updates. **Diagnostics** opens
 the underlying error, stage, and timing measurements without chasing a changing
-message. **Last map integration** measures time since a successful integration
-finished; the age of the input it used is shown separately. An occasional
-short TF wait with recent map updates is normal. A growing integration age
-despite fresh RGB is not.
+message. **Shared evidence saved** measures time since a new shared-map keyframe
+was retained. **Local fusion completed** in Diagnostics measures the separate
+local semantic-map update; the age of the input it used is shown separately.
+A growing shared-evidence age is normal for unchanged parked views after the
+bootstrap, but check the evidence outcome/capacity message if useful new views
+are not being retained. An occasional short TF wait with recent local updates
+is normal; a growing local-fusion age despite fresh RGB needs investigation.
 
 | Symptom | Check |
 | --- | --- |
 | One or both rover cards receive nothing | Domain IDs, reachable DDS discovery, active camera topics, ROS environment and network/firewall settings |
 | RGB and depth visible but SAM, DINO or CLIP missing | Check pairing, calibration, depth registration and the model worker. These views require a calibrated RGB-D observation. |
+| Evidence store full, but cameras/perception remain live | Inspect usage in **Storage & maps**. New shared evidence has reached a graph or recording limit; existing evidence is preserved. Rebuild the current map or explicitly remove selected inactive recordings as appropriate. |
 | Frame already old on arrival | Compare sensor stamps, host clocks and delivery delay. |
 | Waiting for odometry TF or inconsistent visual pose | SAM, DINO and CLIP can update from registered RGB-D. Segments and Entities retain the last mapped overlays until a frame passes pose validation. |
 | Depth registration rejected | Check true optical frames, matching CameraInfo and calibrated depth-to-RGB transform; do not resize depth or guess extrinsics |

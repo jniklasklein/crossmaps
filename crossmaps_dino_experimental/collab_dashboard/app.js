@@ -37,6 +37,154 @@ function anchorTransform(x, y, z, yawDegrees) {
 function normalizeSnapshot(raw) {
   return { ...raw, robots: Array.isArray(raw.robots) ? raw.robots : [], submaps: Array.isArray(raw.submaps) ? raw.submaps : [], candidates: Array.isArray(raw.candidates) ? raw.candidates : [], constraints: Array.isArray(raw.constraints) ? raw.constraints : [], global_entities: Array.isArray(raw.global_entities) ? raw.global_entities : (raw.entities || []), entity_links: Array.isArray(raw.entity_links) ? raw.entity_links : [], events: Array.isArray(raw.events) ? raw.events : [], stats: raw.stats || {} };
 }
+const byteLabel = value => !finite(value) || value < 0 ? "Unknown" : value < 1024 ? `${Math.round(value)} B` : value < 1024 ** 2 ? `${(value / 1024).toFixed(1)} KiB` : value < 1024 ** 3 ? `${(value / 1024 ** 2).toFixed(1)} MiB` : `${(value / 1024 ** 3).toFixed(2)} GiB`;
+const storageRunId = value => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value);
+function storageModel(snapshot, connected = true) {
+  const data = snapshot.storage || {}, stats = snapshot.stats || {}, limits = stats.limits || {};
+  const current = storageRunId(data.current_run_id) ? data.current_run_id : null;
+  const runs = (Array.isArray(data.runs) ? data.runs : []).filter(run => run && storageRunId(run.id));
+  const enabled = connected && snapshot.mode !== "recorded_replay" && data.readonly !== true && snapshot._dashboard?.commands_enabled === true && Boolean(current);
+  return { ...data, free_bytes: data.free_bytes ?? data.disk_free_bytes, reason: data.reason || stats.capacity_reason,
+    current_run_id: current, map_generation: snapshot.map_generation, enabled, runs: runs.map(run => ({ ...run, reason: run.reason || run.protected_reason,
+    deletable: run.deletable === true && run.active !== true && run.id !== current })),
+    keyframes: finite(stats.keyframes) ? stats.keyframes : null, max_keyframes: limits.max_keyframes,
+    evidence_bytes: stats.store_bytes, max_evidence_bytes: limits.max_store_bytes,
+    unavailable: !current ? "Storage information is not available from this coordinator." : !connected ? "Reconnect to the coordinator before changing storage."
+      : snapshot.mode === "recorded_replay" || data.readonly === true ? "Recorded replay is read-only. Open a live coordinator to manage storage."
+      : !snapshot._dashboard?.commands_enabled ? "Storage changes require a local dashboard session." : "" };
+}
+function storageOverview(model) {
+  const count = finite(model.keyframes) ? model.keyframes : "—", limit = finite(model.max_keyframes) ? model.max_keyframes : "—";
+  return `<p class="storage-current">Current run: <code>${escapeText(model.current_run_id || "Unavailable")}</code></p><div class="storage-summary">
+    <div><span>Retained keyframes</span><strong>${count} / ${limit}</strong></div>
+    <div><span>Current evidence / limit</span><strong>${byteLabel(model.evidence_bytes)} / ${byteLabel(model.max_evidence_bytes)}</strong></div>
+    <div><span>All recordings / budget</span><strong>${byteLabel(model.total_bytes)} / ${byteLabel(model.max_total_bytes)}</strong></div></div>
+    <p class="storage-current">Current recording: ${byteLabel(model.current_bytes)} · Disk free: ${byteLabel(model.free_bytes)} · Reserved free space: ${byteLabel(model.min_free_bytes)}.</p>
+    ${finite(model.managed_runs) && finite(model.max_runs) ? `<p class="storage-current">Managed recordings: ${model.managed_runs} / ${model.max_runs}. No automatic deletion.${finite(model.reserved_bytes) && model.reserved_bytes > 0 ? ` In-flight write reservations: ${byteLabel(model.reserved_bytes)}.` : ""}</p>` : ""}`;
+}
+function storageRunsContent(model, selected) {
+  return model.runs.map(run => `<label class="storage-run"><input type="checkbox" data-storage-run="${escapeText(run.id)}" ${selected.has(run.id) ? "checked" : ""} ${!model.enabled || !run.deletable ? "disabled" : ""}>
+    <span>${escapeText(run.id)}<small>${escapeText(run.id === model.current_run_id ? "Current run — use Rebuild current map" : run.active ? "Active — protected" : !run.deletable ? run.reason || "Protected recording" : run.managed === false ? "Recognized legacy recording — explicit removal only" : "Inactive recording")}</small></span><span class="storage-bytes">${byteLabel(run.bytes)}</span></label>`).join("") || '<p class="empty-list">No recordings listed.</p>';
+}
+function storagePlanContent(plan) {
+  return `<p>${escapeText(plan.description || (plan.operation === "rebuild_current" ? "Permanently discard current CrossMaps map evidence and rebuild from new observations." : "Permanently delete the selected old CrossMaps recordings."))}</p>
+    <p>Affected recording${plan.run_ids.length === 1 ? "" : "s"}: <strong>${plan.run_ids.length}</strong> · Prepared size: <strong>${byteLabel(plan.bytes)}</strong></p>
+    <ul>${plan.run_ids.map(id => `<li>${escapeText(id)}</li>`).join("")}</ul>
+    <p>Only the listed CrossMaps data is affected. Robot SLAM, Gazebo and Nav2 are unchanged.</p>`;
+}
+function storageResult(result) {
+  const details = result.result || {};
+  if (details.ok === false) throw new Error(details.error || "The storage operation did not finish.");
+  const warnings = [result.warning, details.warning, ...(Array.isArray(details.warnings) ? details.warnings : [])].filter(Boolean).map(String);
+  const message = result.message || (details.reset_applied ? "Current CrossMaps map cleared; rebuilding from fresh observations."
+    : result.operation === "delete_runs" ? "Selected old recordings removed." : "Storage operation completed.");
+  return { message: `${message}${finite(details.freed_bytes) ? ` Freed ${byteLabel(details.freed_bytes)}.` : ""}${warnings.length ? ` Warning: ${warnings.join("; ")}` : ""}`, warning: warnings.length > 0 };
+}
+// Preparing never deletes. A server-issued scope token is required for the
+// separate confirmation. Polls cannot silently switch the reviewed targets.
+function storageController(send, changed = () => {}) {
+  const state = { model: storageModel({}), selected: new Set(), plan: null, busy: false, message: "", error: false };
+  let generation = 0;
+  const emit = () => changed(state);
+  const note = (message, error = false) => { state.message = message; state.error = error; };
+  return {
+    state,
+    update(snapshot, connected) {
+      const next = storageModel(snapshot, connected);
+      if ((state.model.current_run_id && next.current_run_id !== state.model.current_run_id) ||
+          (state.model.map_generation && next.map_generation !== state.model.map_generation)) {
+        const pending = state.plan || state.busy;
+        generation++; state.plan = null; state.busy = false; state.selected.clear();
+        if (pending) note("The active map changed. Review storage again before confirming.");
+      }
+      state.model = next;
+      state.selected = new Set([...state.selected].filter(id => next.runs.some(run => run.id === id && run.deletable)));
+      emit();
+    },
+    select(id, selected) {
+      if (state.busy || state.plan || !state.model.enabled || !state.model.runs.some(run => run.id === id && run.deletable)) return;
+      if (selected) state.selected.add(id); else state.selected.delete(id);
+      emit();
+    },
+    cancel() { generation++; state.plan = null; state.busy = false; note(""); emit(); },
+    async prepare(operation) {
+      if (state.busy || state.plan) return;
+      if (!state.model.enabled) { note(state.model.unavailable, true); emit(); return; }
+      if (!["rebuild_current", "delete_runs"].includes(operation)) return;
+      const ids = operation === "delete_runs" ? [...state.selected].sort() : [state.model.current_run_id];
+      if (!ids.length) { note("Select at least one inactive recording.", true); emit(); return; }
+      const request = ++generation;
+      state.busy = true; note("Checking the selected data. Nothing has been removed."); emit();
+      try {
+        const result = await send({ action: "prepare_storage", operation, ...(operation === "delete_runs" ? { run_ids: ids } : {}) });
+        if (request !== generation) return;
+        const plan = result.plan;
+        if (!plan || typeof plan.token !== "string" || !plan.token || plan.operation !== operation ||
+            !Array.isArray(plan.run_ids) || !plan.run_ids.every(storageRunId) ||
+            JSON.stringify([...plan.run_ids].sort()) !== JSON.stringify(ids) || !finite(plan.bytes) || plan.bytes < 0)
+          throw new Error("The prepared removal scope does not match your selection. Nothing was confirmed.");
+        state.plan = { ...plan, run_ids: plan.run_ids.slice() };
+        note("Review the exact recordings below. Nothing is removed until you confirm.");
+      } catch (error) { if (request === generation) note(error.message, true); }
+      finally { if (request === generation) { state.busy = false; emit(); } }
+    },
+    async confirm() {
+      if (state.busy || !state.plan) return;
+      if (!state.model.enabled) { note(state.model.unavailable, true); emit(); return; }
+      const request = ++generation, plan = state.plan;
+      state.busy = true; note("Applying the confirmed storage operation…"); emit();
+      try {
+        const result = await send({ action: "confirm_storage", token: plan.token });
+        if (request !== generation) return;
+        const outcome = storageResult(result);
+        state.selected.clear(); note(outcome.message, outcome.warning);
+      } catch (error) { if (request === generation) note(error.message + " Review and prepare again before retrying.", true); }
+      finally { if (request === generation) { state.plan = null; state.busy = false; emit(); } }
+    }
+  };
+}
+function installStorageDialog($, getSnapshot, isConnected, send) {
+  const dialog = $("storage-dialog");
+  let runsKey = "", planKey = "";
+  const controller = storageController(send, state => {
+    if (!dialog.open) return;
+    const { model, plan, busy } = state;
+    $("storage-status").textContent = state.message || model.unavailable || model.reason || "Redundant views are skipped; stored evidence remains bounded. Use these controls when you want to free it.";
+    $("storage-status").className = state.error || model.reason ? "error" : "";
+    $("storage-overview").innerHTML = storageOverview(model);
+    const nextRuns = JSON.stringify([model.current_run_id, model.enabled, model.runs.map(({ id, active, managed, deletable, reason }) => [id, active, managed, deletable, reason])]);
+    if (runsKey !== nextRuns && !plan && !busy) {
+      const scroll = $("storage-runs").scrollTop;
+      $("storage-runs").innerHTML = storageRunsContent(model, state.selected); $("storage-runs").scrollTop = scroll; runsKey = nextRuns;
+    }
+    for (const input of $("storage-runs").querySelectorAll("[data-storage-run]")) {
+      input.checked = state.selected.has(input.dataset.storageRun);
+      input.disabled = busy || !model.enabled || !model.runs.some(run => run.id === input.dataset.storageRun && run.deletable);
+    }
+    $("storage-controls").hidden = Boolean(plan); $("storage-confirmation").hidden = !plan;
+    const nextPlan = plan ? JSON.stringify(plan) : "";
+    if (planKey !== nextPlan) { $("storage-plan").innerHTML = plan ? storagePlanContent(plan) : ""; planKey = nextPlan; }
+    $("storage-rebuild").disabled = busy || !model.enabled;
+    $("storage-delete").disabled = busy || !model.enabled || !state.selected.size;
+    $("storage-confirm").disabled = busy || !model.enabled || !plan;
+    $("storage-confirm").textContent = plan?.operation === "rebuild_current" ? "Delete current evidence & rebuild" : "Permanently delete recordings";
+    $("storage-cancel").disabled = busy;
+    $("storage-close").disabled = busy;
+  });
+  const refresh = () => controller.update(getSnapshot(), isConnected());
+  $("storage-open").addEventListener("click", () => { dialog.showModal(); refresh(); });
+  $("storage-close").addEventListener("click", () => dialog.close());
+  dialog.addEventListener("close", () => controller.cancel());
+  dialog.addEventListener("cancel", event => { if (controller.state.busy) event.preventDefault(); });
+  $("storage-runs").addEventListener("change", event => {
+    const input = event.target.closest("[data-storage-run]"); if (input) controller.select(input.dataset.storageRun, input.checked);
+  });
+  $("storage-rebuild").addEventListener("click", () => controller.prepare("rebuild_current"));
+  $("storage-delete").addEventListener("click", () => controller.prepare("delete_runs"));
+  $("storage-cancel").addEventListener("click", () => controller.cancel());
+  $("storage-confirm").addEventListener("click", () => controller.confirm());
+  return { refresh, controller };
+}
 function buildCloud(snapshot, source = "combined", colorMode = "source", budget = 30000, showProvisional = true) {
   const positions = [], colors = [];
   const robots = snapshot.robots || [], excluded = [], confirmed = [], previews = [];
@@ -245,6 +393,12 @@ function healthPresentation(robot) {
     return { ...result, state: "error", style: "error", label: status === "adapter_exited" ? "Adapter stopped" : "Perception error",
       detail: robot.error || robot.last_error || perception.error || "Processing failed; inspect coordinator events." };
   }
+  if (transport.clock_mode === "simulation" && ["waiting_for_clock", "paused_or_stalled", "reset_restart_required"].includes(transport.simulation_clock_status)) {
+    const clock = transport.simulation_clock_status;
+    return { ...result, state: "simulation_" + clock, style: clock === "reset_restart_required" ? "error" : "pending",
+      label: {waiting_for_clock: "Waiting for sim clock", paused_or_stalled: "Simulation stopped", reset_restart_required: "Simulation reset"}[clock],
+      mapping: "paused", detail: transport.last_error || "Simulation time is not advancing." };
+  }
   if (["depth_stale", "rgbd_stale"].includes(inputStatus)) {
     return { ...result, state: "stale", style: "stale", label: inputStatus === "depth_stale" ? "Depth stale" : "RGB-D stale",
       mapping: "awaiting a fresh pair", detail: transport.camera_relay?.last_error || transport.camera_relay_last_error ||
@@ -292,14 +446,16 @@ function roverHealthCard(robot) {
   const timing = robot.timing || {}, relay = sensor.camera_relay || {};
   const cycle = timing.cycle_avg_s ?? timing.cycle_s ?? (finite(timing.average_ms) ? timing.average_ms / 1000 : finite(timing.cycle_ms) ? timing.cycle_ms / 1000 : null);
   const transport = {dds_compressed: "Compressed DDS", ssh_compressed_pair: "Compressed SSH"}[sensor.camera_transport];
-  const mapAge = robot.map_update_age_s ?? robot.map_observation_age_s;
+  const localAge = robot.local_map_update_age_s ?? robot.map_update_age_s ?? robot.map_observation_age_s;
+  const mapAge = Object.hasOwn(robot, "shared_evidence_age_s") ? robot.shared_evidence_age_s : robot.map_update_age_s ?? robot.map_observation_age_s;
   const expired = sensor.timing_status === "timestamped_tf_wait_expired" || /TF wait expired/i.test(health.detail);
   const shortSync = health.state === "waiting_for_tf" && sensor.status === "waiting_for_tf" && !expired &&
     finite(sensor.pending_wait_s) && sensor.pending_wait_s >= 0 && sensor.pending_wait_s < 1 &&
-    finite(mapAge) && mapAge >= 0 && mapAge < 6;
+    finite(localAge) && localAge >= 0 && localAge < 6;
   let summary = health.label;
   switch (health.state) {
-    case "healthy": case "processing": summary = "No current warning."; break;
+    case "healthy": case "processing": summary = robot.evidence_status === "redundant" || robot.evidence?.outcome === "redundant"
+      ? "Live processing; redundant views are not stored again." : "No current warning."; break;
     case "stale":
       summary = health.label === "Depth stale" ? "Depth has stopped updating." :
         health.label === "RGB-D stale" ? "RGB and depth have stopped updating." : "RGB has stopped updating.";
@@ -313,9 +469,12 @@ function roverHealthCard(robot) {
       break;
     case "input_rejected": summary = "Frame failed input checks; see diagnostics."; break;
     case "mapping_paused": summary = "Pose check blocked map integration."; break;
-    case "capacity_reached": summary = "Keyframe storage is full; existing evidence is retained."; break;
+    case "capacity_reached": summary = "Shared evidence limit reached. Open Storage & maps to manage it."; break;
     case "error": summary = health.label === "Adapter stopped" ? "Input adapter stopped; see diagnostics." : "Processing failed; see diagnostics."; break;
     case "recorded": summary = "Stored observations; not a live source."; break;
+    case "simulation_waiting_for_clock": summary = "Waiting for Gazebo's simulation clock."; break;
+    case "simulation_paused_or_stalled": summary = "Simulation paused or clock publisher stopped."; break;
+    case "simulation_reset_restart_required": summary = "World reset detected; restart the CrossMaps simulation session."; break;
     default: summary = human(health.label) + "…";
   }
   const rows = [
@@ -323,6 +482,9 @@ function roverHealthCard(robot) {
     ["Mapping", human(health.mapping)], ["Pose check", typeof pose === "object" ? pose?.status : pose],
     ["Pose reason", typeof pose === "object" ? pose?.reason : null],
     ["Timing", sensor.timing_status], ["Last mapped input age (s)", robot.map_observation_age_s],
+    ["Local fusion completed (s ago)", localAge], ["Shared evidence retained (s ago)", robot.shared_evidence_age_s],
+    ["Evidence decision", robot.evidence_status || robot.evidence?.reason || robot.evidence?.outcome],
+    ["Clock mode", sensor.clock_mode], ["Simulation clock", sensor.simulation_clock_status],
     ["Last pose source", {dds_tf:"ROS on laptop", source_tf:"capture-time ROS pose from rover"}[sensor.last_pose_source]],
     ["Frames with rover-supplied pose", sensor.source_tf_pairs], ["Last measured pose coverage lag (s)", sensor.tf_coverage_lag_s],
     ["Frame waiting for pose (s)", sensor.pending_wait_s],
@@ -337,7 +499,7 @@ function roverHealthCard(robot) {
   ];
   return { label: shortSync || ["healthy","processing"].includes(health.state) ? "Live" : health.label,
     style: shortSync || health.state === "processing" ? "healthy" : health.style, summary,
-    meta: [`Domain ${robot.domain ?? "—"}`, transport].filter(Boolean).join(" · "),
+    meta: [`Domain ${robot.domain ?? "—"}`, transport, Object.hasOwn(robot, "local_map_update_age_s") ? `Local fusion: ${ageLabel(localAge)} ago` : null].filter(Boolean).join(" · "),
     values: [ageLabel(robot.frame_age_s), ageLabel(robot.observation_age_s), ageLabel(mapAge), ageLabel(cycle),
       `${robot.keyframes ?? robot.counts?.keyframes ?? 0} / ${robot.submaps ?? robot.counts?.submaps ?? 0}`],
     diagnostics: rows.filter(([, v]) => v != null && v !== "").map(([k, v]) => `${k}: ${v}`).join("\n") };
@@ -345,7 +507,7 @@ function roverHealthCard(robot) {
 function human(value) { return String(value ?? "").replaceAll("_", " "); }
 
 function roverCardRenderer(container) {
-  const labels = ["Camera age", "Perception completed", "Last map integration", "Mean cycle", "Keyframes / submaps"];
+  const labels = ["Camera age", "Perception completed", "Shared evidence saved", "Mean cycle", "Keyframes / submaps"];
   let key, cards = [];
   const put = (el, text) => { if (el.textContent !== text) el.textContent = text; };
   return (robots) => {
@@ -401,15 +563,22 @@ function abortableDecode(image, signal) {
     Promise.resolve().then(() => image.decode()).then(() => done(resolve), error => done(reject, error));
   });
 }
-function frameWarning(view, { mode, connected, preview, available, age }) {
+function frameWarning(view, { mode, connected, preview, available, age, simulationClock }) {
   if (!available || mode === "recorded_replay" || !preview) return "";
   if (!connected) return "Last frame · dashboard disconnected";
+  if (simulationClock === "paused_or_stalled") return "Simulation paused or clock stopped";
+  if (simulationClock === "reset_restart_required") return "World reset · restart session";
   if (view === "rgb" && finite(age) && age > 5) return `Stale RGB · last frame ${ageLabel(age)} old`;
   return "";
 }
 function imageCaption(robot, view, { mode, preview = true, available = false, age = null } = {}) {
   if (!available) return "No image for this view/session";
   if (mode === "recorded_replay") return "Recorded observation · not live";
+  const clock = currentComponent(robot, "health");
+  if (clock.clock_mode === "simulation" && clock.simulation_clock_status === "paused_or_stalled")
+    return "Last simulation frame · Gazebo paused or clock stopped";
+  if (clock.clock_mode === "simulation" && clock.simulation_clock_status === "reset_restart_required")
+    return "Previous simulation epoch · restart session after world reset";
   const mapped = ["segments", "entities"].includes(view);
   const kind = view === "rgb" ? "Camera frame" : mapped ? "Last mapped overlay" : "Perception image";
   const label = finite(age) ? `${ageLabel(age)} old` : "age unknown";
@@ -697,7 +866,7 @@ function installIdentityInspector($, getSnapshot) {
     const msg = document.createElement("p"); msg.className = "witness-meta"; msg.textContent = "Marked image unavailable for this recorded keyframe.";
     event.target.replaceWith(msg);
   }, true);
-  return { checkSnapshot };
+  return { checkSnapshot, reset() { reader.cancel(); if (dialog.open) dialog.close(); detail = null; remembered.clear(); body.replaceChildren(); } };
 }
 
 function startDashboard() {
@@ -709,12 +878,19 @@ function startDashboard() {
   let viewer;
   try { viewer = new WorldViewer($("world"), $("map-poses")); } catch (error) { notify(error.message, true); }
   function notify(message, error = false) { $("notice").hidden = false; $("notice").textContent = message; $("notice").classList.toggle("error", error); }
-  async function command(payload) {
+  async function command(payload, { quiet = false, refresh = true } = {}) {
     if (!connected || !snapshot._dashboard?.commands_enabled) throw new Error("Commands are available only from a connected local dashboard.");
     const response = await fetch("/api/command", { method: "POST", headers: { "Content-Type": "application/json", "X-CrossMaps-Token": snapshot._dashboard.command_token }, body: JSON.stringify(payload), signal: AbortSignal.timeout(15000) });
     const result = await response.json(); if (!response.ok || result.ok === false) throw new Error(result.error || "Command was rejected");
-    notify(result.message || result.reason || "Command applied. Local source evidence is preserved."); await poll(); return result;
+    if (!quiet) notify(result.message || result.reason || "Command applied. Local source evidence is preserved."); if (refresh) await poll(); return result;
   }
+  const storage = installStorageDialog($, () => snapshot, () => connected, async payload => {
+    const result = await command(payload, { quiet: true, refresh: false });
+    // Let the controller show any committed-reset/partial-cleanup warning
+    // before a new map generation arrives and clears stale review state.
+    if (payload.action === "confirm_storage") setTimeout(poll, 0);
+    return result;
+  });
   const renderRobots = roverCardRenderer($("robots"));
   function invalidateCamera(camera, message) {
     camera.generation++; camera.controller?.abort();
@@ -731,7 +907,8 @@ function startDashboard() {
     for (const robot of snapshot.robots) {
       const camera = cameraState.get(robotId(robot));
       if (!camera) continue;
-      const data = {mode: snapshot.mode, connected, preview, available: Boolean(camera.url), age: displayedImageAge(camera, performance.now())};
+      const data = {mode: snapshot.mode, connected, preview, available: Boolean(camera.url), age: displayedImageAge(camera, performance.now()),
+        simulationClock: currentComponent(robot, "health").clock_mode === "simulation" ? currentComponent(robot, "health").simulation_clock_status : null};
       camera.card.querySelector("[data-image-age]").textContent = connected ? imageCaption(robot, camera.view, data) : "Coordinator disconnected · last received frame";
       const badge = camera.card.querySelector("[data-frame-warning]");
       badge.textContent = frameWarning(camera.view, data); badge.hidden = !badge.textContent;
@@ -867,17 +1044,24 @@ $("entities").insertAdjacentHTML("beforeend", proposedLinks.map((link) => `<arti
     if (pollBusy) return; pollBusy = true;
     try {
       const response = await fetch("/api/state", { cache: "no-store", signal: AbortSignal.timeout(7000) }); if (!response.ok) throw new Error(`Coordinator returned ${response.status}`);
-      snapshot = normalizeSnapshot(await response.json()); connected = true; snapshotAt = performance.now(); $("connection").textContent = `Coordinator connected · ${snapshot.robots.length} rover sources`; $("connection-dot").classList.add("online");
+      const previousGeneration = snapshot.map_generation;
+      snapshot = normalizeSnapshot(await response.json()); connected = true; snapshotAt = performance.now();
+      if (previousGeneration && snapshot.map_generation !== previousGeneration) {
+        lastEvidenceKey = null; lastRenderKey = ""; inspector.reset();
+        for (const camera of cameraState.values()) invalidateCamera(camera, "Map rebuilt · waiting for a fresh view…");
+        if (viewer) viewer.autoFit = true;
+      }
+      $("connection").textContent = `Coordinator connected · ${snapshot.robots.length} rover sources`; $("connection-dot").classList.add("online");
       const mode = modePresentation(snapshot); $("mode-badge").textContent = mode.label; $("mode-badge").className = `badge ${mode.style}`;
       $("shadow").checked = snapshot.shadow_mode !== false; $("shadow").disabled = !snapshot._dashboard?.commands_enabled;
       $("shadow-explanation").textContent = shadowDescription(snapshot.shadow_mode);
-      renderRobots(snapshot.robots); ensureCameras(); renderEvidence(); inspector.checkSnapshot();
+      renderRobots(snapshot.robots); ensureCameras(); renderEvidence(); inspector.checkSnapshot(); storage.refresh();
       const key = JSON.stringify([snapshot.revision, snapshot.shadow_mode, source, $("color-mode").value, $("budget").value,
         snapshot.robots.map(r => [r.session_id, r.trajectory?.latest?.seq, r.trajectory?.tracking_lost, mappingPaused(r), r.map_observation_age_s > 8]),
         snapshot.submaps.map((s) => [s.id, s.aligned, s.alignment_state, s.T_preview_world_submap, s.pose_version, s.points?.length])]);
       if (key !== lastRenderKey || snapshot.revision === undefined) { renderMap(); lastRenderKey = key; }
       refreshCameraCaptions();
-    } catch (error) { const wasConnected = connected; connected = false; $("connection-dot").classList.remove("online"); $("connection").textContent = `Disconnected · ${error.message}`; for (const button of document.querySelectorAll("[data-action], #save, #anchor-form button")) button.disabled = true; $("shadow").disabled = true; if (wasConnected) { lastRenderKey = ""; renderMap(); } refreshCameraCaptions(); }
+    } catch (error) { const wasConnected = connected; connected = false; $("connection-dot").classList.remove("online"); $("connection").textContent = `Disconnected · ${error.message}`; for (const button of document.querySelectorAll("[data-action], #save, #anchor-form button")) button.disabled = true; $("shadow").disabled = true; storage.refresh(); if (wasConnected) { lastRenderKey = ""; renderMap(); } refreshCameraCaptions(); }
     finally { pollBusy = false; }
   }
   async function fullscreen(element) { try { if (document.fullscreenElement) await document.exitFullscreen(); else if (element.requestFullscreen) await element.requestFullscreen(); else notify("Full screen is unavailable in this browser. Increase the browser window to enlarge the view."); } catch (error) { notify(error.message, true); } }
@@ -896,5 +1080,5 @@ $("entities").insertAdjacentHTML("beforeend", proposedLinks.map((link) => `<arti
   const images = () => { refreshCameraCaptions(); for (const [id, camera] of cameraState) refreshCamera(id, camera); setTimeout(images, 1000); }; images();
 }
 
-if (typeof module !== "undefined" && module.exports) module.exports = { robotId, escapeText, ageLabel, matrix, transformPoint, inverseRigid, matrixProduct, anchorTransform, normalizeSnapshot, buildCloud, buildRoverOverlay, projectMarker, drawRoverOverlay, roverPoseLegend, candidateConstraint, activeEntityLink, modePresentation, imageAge, orderedCandidates, currentComponent, mappingPaused, healthPresentation, healthState, roverHealthCard, roverCardRenderer, displayedImageAge, receivedImageAge, abortableDecode, frameWarning, imageCaption, shadowDescription, alignmentEvidence, candidateReason, evidenceRenderKey, identityUrl, selectedWitness, witnessImage, identityContent, identityRequestReader, identityLinkSignature, identityFromHash, installIdentityInspector };
+if (typeof module !== "undefined" && module.exports) module.exports = { robotId, escapeText, ageLabel, matrix, transformPoint, inverseRigid, matrixProduct, anchorTransform, normalizeSnapshot, buildCloud, buildRoverOverlay, projectMarker, drawRoverOverlay, roverPoseLegend, candidateConstraint, activeEntityLink, modePresentation, imageAge, orderedCandidates, currentComponent, mappingPaused, healthPresentation, healthState, roverHealthCard, roverCardRenderer, displayedImageAge, receivedImageAge, abortableDecode, frameWarning, imageCaption, shadowDescription, alignmentEvidence, candidateReason, evidenceRenderKey, identityUrl, selectedWitness, witnessImage, identityContent, identityRequestReader, identityLinkSignature, identityFromHash, installIdentityInspector, byteLabel, storageModel, storageOverview, storageRunsContent, storagePlanContent, storageResult, storageController, installStorageDialog };
 if (typeof document !== "undefined") { if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", startDashboard); else startDashboard(); }

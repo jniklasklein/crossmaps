@@ -194,7 +194,9 @@ class ProvisionalAlignmentTests(unittest.TestCase):
         backend = self.backend()
         self.assertEqual(self.rover(self.parked(backend))['alignment_state'], 'provisional')
         for seq in range(4, 37):
-            snap = backend.ingest(observation('B', seq, local_pose=self.b_origin))
+            # Expiry is based on new retained views, not duplicate parked
+            # captures (which the admission policy now deliberately skips).
+            snap = backend.ingest(observation('B', seq, local_pose=self.b_origin @ pose(.2*(seq-3))))
         self.assertEqual(self.rover(snap)['alignment_state'], 'unaligned')
         self.assertEqual(snap['stats']['accepted_loops'], 0)
 

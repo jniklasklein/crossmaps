@@ -162,6 +162,28 @@ class ApplicationTests(unittest.TestCase):
         self.assertGreater(state['frame_age_s'], 19)
         self.assertEqual(state['status'], 'input_stale')
 
+    def test_sim_pause_keeps_honest_wall_age_without_camera_failure_label(self):
+        self.pair()
+        self.app.config['input']['use_sim_time'] = True
+        self.app.telemetry['rover_a']['health'] = dict(clock_mode='simulation',
+            simulation_clock_status='paused_or_stalled', rgb_advanced_monotonic=time.monotonic()-20)
+        state = self.app.snapshot()['robots'][0]
+        self.assertGreater(state['frame_age_s'], 19)
+        self.assertEqual(state['status'], 'simulation_paused_or_stalled')
+
+    def test_sim_reset_rejects_queued_and_new_observations_until_restart(self):
+        self.pair()
+        self.app.config['input']['use_sim_time'] = True
+        packet = observations(1, self.config['robots'])[0]
+        self.app.offer(packet)
+        before = len(self.app.backend.keyframes)
+        self.app.telemetry['rover_a']['health'] = dict(clock_mode='simulation',
+            simulation_clock_status='reset_restart_required')
+        self.assertFalse(self.app.process_one())
+        self.assertFalse(self.app.offer(observations(2, self.config['robots'])[0]))
+        self.assertEqual(len(self.app.backend.keyframes), before)
+        self.assertEqual(self.app.snapshot()['robots'][0]['status'], 'simulation_reset_restart_required')
+
     def test_snapshot_is_detached_and_strict_json(self):
         self.pair()
         state = self.app.snapshot()

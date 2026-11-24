@@ -715,6 +715,27 @@ class PerceptionFleet:
                                  support_points=len(selected), observation_support="accepted_current_depth"))
         return surfaces
 
+    def reset_maps(self):
+        """Forget local geometry, identities and pose history, retaining loaded models.
+
+        Called by an explicit dashboard rebuild, serialized against inference.
+        No robot SLAM, TF, sensor, or actuator is changed.
+        """
+        with self._process_lock:
+            old_nodes = tuple(self._nodes.values())
+            self._nodes.clear()
+            self._sessions.clear()
+            self._last.clear()
+            self._guards.clear()
+            self._last_integrated.clear()
+            self._preview_cache.clear()
+            self._active_frames.clear()
+            with self._snapshot_lock:
+                self._images.clear()
+                self._health.clear()
+            for node in old_nodes:
+                node.destroy_node()
+
     def close(self):
         with self._process_lock:
             for node in self._nodes.values():

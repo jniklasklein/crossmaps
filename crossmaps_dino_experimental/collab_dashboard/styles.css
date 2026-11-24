@@ -42,3 +42,22 @@
   .rover-summary{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;white-space:normal}
   .rover-diagnostics summary{height:2.8em}
 }
+
+/* Storage controls are demand-opened; polling never moves the main dashboard
+   or replaces a pending confirmation with a different deletion target. */
+#storage-dialog{width:min(860px,94vw);height:min(760px,90vh);overflow:auto;overscroll-behavior:contain;color:#edf1f5;background:var(--panel);border:1px solid #455771;border-radius:12px;padding:clamp(14px,3vw,26px)}
+#storage-dialog::backdrop{background:rgba(4,9,15,.78)}
+#storage-status{min-height:2.8em;font-size:12px;line-height:1.4;color:#aabacc;margin:12px 0;overflow-wrap:anywhere}
+#storage-status.error,.storage-danger{color:#f4aaa7}
+.storage-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.storage-summary>div{min-width:0;border:1px solid var(--line);border-radius:7px;padding:11px;background:#0e1620}
+.storage-summary span{display:block;color:var(--muted);font-size:11px;margin-bottom:6px}.storage-summary strong{font-size:13px;font-variant-numeric:tabular-nums}
+.storage-current{font-size:12px;color:#aabacc;line-height:1.5;overflow-wrap:anywhere}.storage-current code{color:var(--cyan)}
+.storage-section{border-top:1px solid var(--line);margin-top:17px;padding-top:14px}.storage-section h3,.storage-confirmation h3{font-size:14px;margin:0 0 7px}
+.storage-section p,.storage-confirmation p{font-size:12px;line-height:1.6;color:#aabacc;margin:8px 0 12px}
+.storage-runs{max-height:210px;min-height:64px;overflow:auto;margin:10px 0 12px;border:1px solid var(--line);border-radius:7px}
+.storage-run{display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:9px;align-items:center;padding:11px;border-bottom:1px solid var(--line)}
+.storage-run:last-child{border-bottom:0}.storage-run input{accent-color:var(--cyan)}.storage-run span{overflow-wrap:anywhere;line-height:1.4}.storage-run small{display:block;color:var(--muted);margin-top:3px}.storage-run .storage-bytes{color:#aabacc;font-size:11px;white-space:nowrap}
+.storage-confirmation{border:1px solid #8d6054;background:#241e20;padding:16px;border-radius:9px;margin-top:16px}.storage-confirmation ul{max-height:190px;overflow:auto;padding-left:20px;overflow-wrap:anywhere;font-size:12px;line-height:1.7}.storage-confirmation .storage-danger{color:#f4aaa7}
+.storage-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px}.danger{border-color:#956359;background:#4c2b2c;color:#ffcbc5}.danger:hover{background:#633536;border-color:#bb8176}
+@media(max-width:650px){.storage-summary{grid-template-columns:1fr}.storage-run{grid-template-columns:18px minmax(0,1fr)}.storage-run .storage-bytes{grid-column:2}}

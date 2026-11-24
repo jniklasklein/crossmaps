@@ -22,7 +22,7 @@ _STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
            "/app.js": ("app.js", "text/javascript; charset=utf-8"),
            "/styles.css": ("styles.css", "text/css; charset=utf-8")}
 _VIEWS = frozenset(("rgb", "sam", "segments", "entities", "dino", "dino_similarity", "clip", "depth"))
-_COMMANDS = frozenset(("anchor", "clear_anchor", "accept_constraint", "reject_constraint", "set_shadow_mode", "accept_entity_link", "unlink_entities", "save"))
+_COMMANDS = frozenset(("anchor", "clear_anchor", "accept_constraint", "reject_constraint", "set_shadow_mode", "accept_entity_link", "unlink_entities", "save", "prepare_storage", "confirm_storage"))
 _ROBOT = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # All three identifiers are opaque store hashes, never filesystem paths.
 _IDENTITY = re.compile(r"/api/identity/([0-9a-f]{20})(?:/([0-9a-f]{20})/([0-9a-f]{20})\.jpg)?")

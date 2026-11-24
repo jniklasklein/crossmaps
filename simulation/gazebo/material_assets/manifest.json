@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "provider": "Poly Haven",
+  "provider_url": "https://polyhaven.com",
+  "retrieved_date": "2026-11-23",
+  "license": "CC0-1.0",
+  "license_url": "https://polyhaven.com/license",
+  "metadata_url": "https://api.polyhaven.com/assets?t=textures",
+  "path_base": "manifest directory",
+  "materials": {
+    "wood": {
+      "asset_id": "oak_wood_planks",
+      "source_url": "https://polyhaven.com/a/oak_wood_planks",
+      "metadata_url": "https://api.polyhaven.com/files/oak_wood_planks",
+      "license": "CC0-1.0",
+      "license_url": "https://polyhaven.com/license",
+      "authors": {
+        "Dimitrios Savva": "All"
+      },
+      "scale_m": 1.2,
+      "source_dimensions_mm": [
+        1200.0000476837158,
+        1200.0000476837158
+      ],
+      "resolution": [
+        1024,
+        1024
+      ],
+      "normal_convention": "OpenGL tangent-space (+Y)",
+      "albedo": {
+        "path": "oak_wood_planks/oak_wood_planks_diff_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/oak_wood_planks/oak_wood_planks_diff_1k.jpg",
+        "md5": "e9e25ac7abcc482f73214fda23e2de25",
+        "sha256": "f715ed3e4346e94f971ef8dd61221ff6cc774886c20f65381e01e1dc0bb0a634",
+        "bytes": 696814,
+        "color_space": "sRGB"
+      },
+      "normal": {
+        "path": "oak_wood_planks/oak_wood_planks_nor_gl_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/oak_wood_planks/oak_wood_planks_nor_gl_1k.jpg",
+        "md5": "6a71c23551887b77b29623bb871aefbf",
+        "sha256": "b4272cb2818f8f33f2620a2dc093c962f34920e9d485a4e132eb6d69de1ba950",
+        "bytes": 392213,
+        "color_space": "linear"
+      },
+      "roughness": {
+        "path": "oak_wood_planks/oak_wood_planks_rough_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/oak_wood_planks/oak_wood_planks_rough_1k.jpg",
+        "md5": "3609ef0a3155ae90b69395431bf8cec1",
+        "sha256": "10ced559145df3c537bf1ccef6dc767ef6c47e134c21a9650bab261fa95ecacf",
+        "bytes": 845590,
+        "color_space": "linear"
+      }
+    },
+    "floor": {
+      "asset_id": "wood_floor",
+      "source_url": "https://polyhaven.com/a/wood_floor",
+      "metadata_url": "https://api.polyhaven.com/files/wood_floor",
+      "license": "CC0-1.0",
+      "license_url": "https://polyhaven.com/license",
+      "authors": {
+        "Dimitrios Savva": "All"
+      },
+      "scale_m": 1.7,
+      "source_dimensions_mm": [
+        1699.9996900558472,
+        1699.9996900558472
+      ],
+      "resolution": [
+        1024,
+        1024
+      ],
+      "normal_convention": "OpenGL tangent-space (+Y)",
+      "albedo": {
+        "path": "wood_floor/wood_floor_diff_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/wood_floor/wood_floor_diff_1k.jpg",
+        "md5": "b7e927d2bf2f8f103820ff3890c8407c",
+        "sha256": "2a1c07687b6dbb214c4b9213739c6d92d425f1f0fc8ab3ac157f105d78240789",
+        "bytes": 734493,
+        "color_space": "sRGB"
+      },
+      "normal": {
+        "path": "wood_floor/wood_floor_nor_gl_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/wood_floor/wood_floor_nor_gl_1k.jpg",
+        "md5": "620f174d2c09b579c5d02d37b2106668",
+        "sha256": "452247f0d0d1b7fc7f8324ff3b6ed60bcc6de1405f4284eeb8d9bce90d4939c2",
+        "bytes": 423303,
+        "color_space": "linear"
+      },
+      "roughness": {
+        "path": "wood_floor/wood_floor_rough_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/wood_floor/wood_floor_rough_1k.jpg",
+        "md5": "36146634f1dbd1bc30cd071857584c10",
+        "sha256": "061f1e1293251b2d28c76e3fac1ea9452b0e8648bb8f9b3728e09db386166e5c",
+        "bytes": 527754,
+        "color_space": "linear"
+      }
+    },
+    "plaster": {
+      "asset_id": "white_plaster_02",
+      "source_url": "https://polyhaven.com/a/white_plaster_02",
+      "metadata_url": "https://api.polyhaven.com/files/white_plaster_02",
+      "license": "CC0-1.0",
+      "license_url": "https://polyhaven.com/license",
+      "authors": {
+        "Rob Tuytel": "All"
+      },
+      "scale_m": 1,
+      "source_dimensions_mm": [
+        1000,
+        1000
+      ],
+      "resolution": [
+        1024,
+        1024
+      ],
+      "normal_convention": "OpenGL tangent-space (+Y)",
+      "albedo": {
+        "path": "white_plaster_02/white_plaster_02_diff_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/white_plaster_02/white_plaster_02_diff_1k.jpg",
+        "md5": "7b10c2686bcfd76d1f309a20fd06b57e",
+        "sha256": "a1ebbe091bd1ae93d2abd5de8d69f9003a8d0ee6532bcf9a87c2492c97051f23",
+        "bytes": 527219,
+        "color_space": "sRGB"
+      },
+      "normal": {
+        "path": "white_plaster_02/white_plaster_02_nor_gl_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/white_plaster_02/white_plaster_02_nor_gl_1k.jpg",
+        "md5": "55fc03203ebf1dc703a380fde93ff502",
+        "sha256": "eb572ca3630d5bfde72e2601b1f02412da23ca005cd19384dced8690be4cb783",
+        "bytes": 652310,
+        "color_space": "linear"
+      },
+      "roughness": {
+        "path": "white_plaster_02/white_plaster_02_rough_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/white_plaster_02/white_plaster_02_rough_1k.jpg",
+        "md5": "8b28f263360b8c4ddbdc4f7c650c4eeb",
+        "sha256": "4ff1fe957cd161b07f721fe6c28a9459c8c2e8ec65627a26c16e483a07c80d85",
+        "bytes": 295900,
+        "color_space": "linear"
+      }
+    },
+    "fabric": {
+      "asset_id": "denim_fabric_03",
+      "source_url": "https://polyhaven.com/a/denim_fabric_03",
+      "metadata_url": "https://api.polyhaven.com/files/denim_fabric_03",
+      "license": "CC0-1.0",
+      "license_url": "https://polyhaven.com/license",
+      "authors": {
+        "colormass": "Photography",
+        "Rico Cilliers": "Processing"
+      },
+      "scale_m": 0.271,
+      "source_dimensions_mm": [
+        271.42801281852286,
+        270.9999978542328
+      ],
+      "resolution": [
+        1024,
+        1022
+      ],
+      "normal_convention": "OpenGL tangent-space (+Y)",
+      "albedo": {
+        "path": "denim_fabric_03/denim_fabric_03_diff_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/denim_fabric_03/denim_fabric_03_diff_1k.jpg",
+        "md5": "47d393fc300542e8694912fd5201dc8c",
+        "sha256": "4a1d34077a5c999f590a31a056be5f70edac19f254b6d970e41942b335788575",
+        "bytes": 1082373,
+        "color_space": "sRGB"
+      },
+      "normal": {
+        "path": "denim_fabric_03/denim_fabric_03_nor_gl_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/denim_fabric_03/denim_fabric_03_nor_gl_1k.jpg",
+        "md5": "5178f20974cb959c88ecf40dc8010bee",
+        "sha256": "9b72b5f97f71d4256acb7ee21e532d7fe8af93c49aabf196cc6692b63bd67c09",
+        "bytes": 981862,
+        "color_space": "linear"
+      },
+      "roughness": {
+        "path": "denim_fabric_03/denim_fabric_03_rough_1k.jpg",
+        "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/denim_fabric_03/denim_fabric_03_rough_1k.jpg",
+        "md5": "5c4a7da91600e1cab87bba0f8d6311ed",
+        "sha256": "1c92a2278fb834849ae2c16379a6f5a0e6c616c237654791a93bbdc86c7b1d43",
+        "bytes": 830762,
+        "color_space": "linear"
+      }
+    }
+  }
+}

@@ -19,6 +19,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 
 import cv2
 import numpy as np
@@ -26,6 +27,7 @@ import numpy as np
 from collab_backend import Backend
 from collab_config import CLIP_PRESETS, ROOT, configure_shared_clip, load_config, owned_run_directory
 from collab_dashboard import CollaborativeDashboard
+from collab_log_budget import ScopedLogBudget
 from collab_runtime import FairLatestScheduler, CycleTiming
 from collab_transport import require_compressed_transport, run_adapter
 from pipeline_instance import PipelineInstance
@@ -33,8 +35,15 @@ from pipeline_instance import PipelineInstance
 
 class FleetApplication:
     """Owns all writes to backend state and exposes immutable UI snapshots."""
-    def __init__(self, config, run_dir, *, demo=False, fleet=None, replay=False):
+    def __init__(self, config, run_dir, *, demo=False, fleet=None, replay=False, storage=None):
         self.config, self.run_dir, self.demo, self.replay = config, Path(run_dir), demo, replay
+        self.storage = storage
+        self.mapping_lock = threading.RLock()
+        self.map_generation = uuid.uuid4().hex
+        self.map_epoch_started = 0.
+        self.map_reset_error = None
+        self.storage_plans = {}
+        self.log_budget = ScopedLogBudget(self.run_dir) if storage and not replay else None
         if replay:
             if not (self.run_dir / 'evidence' / 'state.json').is_file():
                 raise ValueError('Replay requires a completed collaborative evidence checkpoint')
@@ -46,7 +55,8 @@ class FleetApplication:
                 # A recording's config.json describes how it STARTED. The last
                 # checkpoint has the actual operator decision at shutdown.
                 backend_options.pop('shadow_mode', None)
-            self.backend = Backend(backend_options, self.run_dir / 'evidence')
+            self.backend = Backend(backend_options, self.run_dir / 'evidence',
+                                   evidence_budget=storage.check_write if storage else None)
         self.backend_lock = threading.RLock()
         self.state_lock = threading.RLock()
         self.cached = self.backend.snapshot()
@@ -101,13 +111,18 @@ class FleetApplication:
             raise ValueError('unknown source')
         if self.replay:
             raise ValueError('Recorded replay does not accept live input')
-        if not self.scheduler.offer(observation):
+        if self._simulation_reset_blocked(robot):
             return False
+        with self.scheduler.lock:
+            if observation['received_monotonic'] < self.map_epoch_started:
+                return False  # Queued pre-rebuild captures cannot enter the new map.
+            if not self.scheduler.offer(observation):
+                return False
         received = observation['received_monotonic']
         with self.state_lock:
             state = self.telemetry[robot]
             if state.get('session_id') != observation['session_id']:
-                for key in ('last_mapped_monotonic', 'map_finished_monotonic', 'last_processed_monotonic', 'last_processed_stamp_ns',
+                for key in ('last_mapped_monotonic', 'map_finished_monotonic', 'shared_evidence_monotonic', 'last_processed_monotonic', 'last_processed_stamp_ns',
                             'pose_quality', 'counts', 'last_error'):
                     state.pop(key, None)
             # Live adapters supply camera previews asynchronously. Demo and direct
@@ -123,11 +138,25 @@ class FleetApplication:
                          calibration_id=observation.get('calibration_id'))
         return True
 
+    def _simulation_reset_blocked(self, robot):
+        return (self.config['input'].get('use_sim_time', False) and
+                self.telemetry[robot].get('health', {}).get('simulation_clock_status') == 'reset_restart_required')
+
     def process_one(self):
+        # Rebuild waits for this observation to finish, then clears both local
+        # and shared state before the next observation can be processed.
+        with self.mapping_lock:
+            return self._process_one_locked()
+
+    def _process_one_locked(self):
+        if self.map_reset_error:
+            return False  # A failed local reset must never mix old and new maps.
         observation = self.scheduler.take()
         if observation is None:
             return False
         robot = observation['robot_id']
+        if self._simulation_reset_blocked(robot):
+            return False
         started = time.monotonic()
         with self.state_lock:
             self.active_robot, self.active_since = robot, started
@@ -142,7 +171,10 @@ class FleetApplication:
                     self.fleet = PerceptionFleet(self.config, context=self.context)
                 enriched = self.fleet.process(observation)
                 inference_elapsed = time.monotonic()-started
+            if self._simulation_reset_blocked(robot):
+                return False  # A world reset during inference cannot extend the old map.
             preview_only = observation.get('preview_only', False)
+            retained = False
             if preview_only:
                 with self.backend_lock:
                     if self.backend.mark_trajectory_gap(robot, observation['session_id']):
@@ -152,8 +184,13 @@ class FleetApplication:
             else:
                 with self.backend_lock:
                     previous_count = len(self.backend.keyframes)
-                    snapshot = self.backend.ingest(enriched)
-                    if len(self.backend.keyframes) != previous_count:
+                    try:
+                        snapshot = self.backend.ingest(enriched)
+                    finally:
+                        if self.storage:
+                            self.storage.finish_write()
+                    retained = len(self.backend.keyframes) != previous_count
+                    if retained:
                         self.next_idle_verification = time.monotonic() + 8.
                     with self.state_lock:
                         self.cached = snapshot
@@ -172,6 +209,8 @@ class FleetApplication:
                     # Input age and time since integration are different when
                     # waiting for measured TF or sharing the inference worker.
                     state['map_finished_monotonic'] = finished
+                if retained:
+                    state['shared_evidence_monotonic'] = finished
                 status = 'waiting_for_tf' if preview_only else 'healthy' if allowed else 'pose_rejected'
                 state.update(status=status,
                     last_processed_monotonic=finished,
@@ -197,7 +236,7 @@ class FleetApplication:
     def _idle_verification(self):
         """Give one skipped pair a turn in a quiet live session. Never invent input."""
         now = time.monotonic()
-        if (self.demo or self.replay or self.stop_event.is_set() or now < self.next_idle_verification or
+        if (self.demo or self.replay or self.map_reset_error or self.stop_event.is_set() or now < self.next_idle_verification or
                 any(q['pending'] for q in self.scheduler.snapshot().values())):
             return False
         self.next_idle_verification = now + 8.
@@ -257,6 +296,8 @@ class FleetApplication:
             raise
 
     def poll_inputs(self):
+        if self.log_budget:
+            self.log_budget.tick()
         for robot, adapter in self.adapters.items():
             if not adapter['process'].is_alive():
                 with self.state_lock:
@@ -319,10 +360,19 @@ class FleetApplication:
                 data['map_observation_age_s'] = None if mapped is None else round(now-mapped, 2)
                 finished = data.get('map_finished_monotonic')
                 data['map_update_age_s'] = None if finished is None else round(now-finished, 2)
+                data['local_map_update_age_s'] = data['map_update_age_s']
+                retained = data.get('shared_evidence_monotonic')
+                data['shared_evidence_age_s'] = None if retained is None else round(now-retained, 2)
+                data['evidence_status'] = data.get('evidence', {}).get('outcome')
                 data['timing'] = self.timing[robot].snapshot()
                 data['timing_ms'] = data['timing']
                 data['image_age_s'] = {view: round(now-stamp, 2) for (source, view), (_, stamp) in self.images.items() if source == robot}
-                if data['frame_age_s'] is not None and data['frame_age_s'] > 5 and data['status'] not in ('adapter_exited', 'processing_error', 'input_rejected'):
+                sim_clock = data.get('health', {}).get('simulation_clock_status')
+                if (self.config['input'].get('use_sim_time', False) and sim_clock in
+                        ('waiting_for_clock', 'paused_or_stalled', 'reset_restart_required') and
+                        data['status'] not in ('adapter_exited', 'processing_error')):
+                    data['status'] = 'simulation_'+sim_clock
+                elif data['frame_age_s'] is not None and data['frame_age_s'] > 5 and data['status'] not in ('adapter_exited', 'processing_error', 'input_rejected'):
                     data['status'] = 'input_stale'
                 robots.append(data)
             # A new adapter session can arrive before its first accepted RGB-D
@@ -344,22 +394,28 @@ class FleetApplication:
                     data.update(status='recorded', frame_age_s=None, observation_age_s=None,
                                 image_age_s={key: None for key in data['image_age_s']})
             snapshot.update(robots=robots, mode='recorded_replay' if self.replay else 'synthetic_demo' if self.demo else 'live',
-                run_dir=str(self.run_dir), central_domain=self.config['central_domain'],
+                run_dir=str(self.run_dir), map_generation=self.map_generation, central_domain=self.config['central_domain'],
                 uptime_s=round(now-self.started, 1), timing=self.total_timing.snapshot(),
                 active_robot=self.active_robot,
                 processing_age_s=None if self.active_since is None else round(now-self.active_since, 1))
             snapshot['events'] = (snapshot.get('events', [])+list(self.events))[-80:]
         scheduler = self.scheduler.snapshot()
-        fleet_health = self.fleet.health() if self.fleet else {}
+        fleet_health = self.fleet.health() if self.fleet and not self.map_reset_error else {}
         for data in snapshot['robots']:
             robot = data['robot_id']
             data['scheduler'] = scheduler[robot]
             health = fleet_health.get(robot, {})
             session = data.get('session_id')
             data['perception'] = health if health.get('session_id') == session else {}
-            if self.fleet and session:
+            if self.map_reset_error:
+                data.update(status='processing_error', mapping_status='reset_failed',
+                            last_error=self.map_reset_error, perception={})
+                data['image_age_s'] = {key: age for key, age in data['image_age_s'].items()
+                                       if key in ('rgb', 'depth')}
+            elif self.fleet and session:
                 for view, received in self.fleet.image_metadata(robot, session).items():
                     data['image_age_s'].setdefault(view, round(max(0., now-received), 2))
+        snapshot['storage'] = self.storage.inventory() if self.storage else None
         return snapshot
 
     def image(self, robot, view):
@@ -368,6 +424,8 @@ class FleetApplication:
 
     def _image_response(self, robot, view):
         if robot not in self.telemetry:
+            return None
+        if self.map_reset_error and view not in ('rgb', 'depth'):
             return None
         with self.state_lock:
             result = self.images.get((robot, view))
@@ -387,6 +445,8 @@ class FleetApplication:
             return self.backend.identity_evidence_image(link, member, frame)
 
     def command(self, command):
+        if command.get('action') in ('prepare_storage', 'confirm_storage'):
+            return self._storage_command(command)
         if self.replay and command.get('action') == 'save':
             raise ValueError('Replay decisions are in-memory only; the source recording is read-only')
         with self.backend_lock:
@@ -395,6 +455,89 @@ class FleetApplication:
             with self.state_lock:
                 self.cached = snapshot
         return result
+
+    def _storage_command(self, command):
+        if self.replay or self.storage is None:
+            raise ValueError('Storage changes require a live, managed recording; replay is read-only')
+        if command['action'] == 'prepare_storage':
+            operation = command.get('operation')
+            if operation == 'rebuild_current':
+                plan = self.storage.prepare_reset()
+                description = ('Permanently delete this run’s retained map evidence and clear its local maps, '
+                               'alignments, identities and paths. Rebuild from new camera observations. '
+                               'Robot SLAM, Gazebo and navigation are not reset.')
+            elif operation == 'delete_runs':
+                plan = self.storage.prepare_cleanup(command.get('run_ids', []))
+                description = 'Permanently delete only the selected inactive recordings. This cannot be undone.'
+            else:
+                raise ValueError('Unknown storage operation')
+            self.storage_plans = {plan['token']: (operation, self.map_generation)}
+            runs = plan.get('run_ids', plan.get('runs', []))
+            run_ids = [r['id'] if isinstance(r, dict) else r for r in runs]
+            if operation == 'rebuild_current':
+                run_ids = [self.run_dir.name]
+            return dict(ok=True, plan=dict(token=plan['token'], operation=operation,
+                        run_ids=run_ids, bytes=plan['bytes'], description=description))
+        token = command.get('token')
+        if not isinstance(token, str) or token not in self.storage_plans:
+            raise ValueError('Prepare a storage operation before confirming it')
+        operation, generation = self.storage_plans.pop(token)
+        with self.mapping_lock:
+            if generation != self.map_generation:
+                raise ValueError('The active map changed; review the operation again')
+            if operation == 'delete_runs':
+                result = self.storage.cleanup(token)
+                complete = result.get('ok', True)
+                message = (f"Removed {len(result.get('removed', []))} selected recordings; "
+                           f"freed {result.get('freed_bytes', 0)} bytes.")
+                if not complete:
+                    message += ' ' + result.get('error', 'Cleanup was only partially completed.')
+                self.event('storage', message)
+                return dict(ok=complete, error=None if complete else message, message=message,
+                            operation=operation, result=result, storage=self.storage.inventory(force=True))
+            # Delete only after an explicit, previewed confirmation. Captures
+            # acquired before this boundary are discarded, even if still queued
+            # in an input adapter. Shared neural weights remain loaded.
+            with self.backend_lock:
+                options = dict(self.backend.config)
+                # Validate and allocate before deleting anything. Once the disk
+                # reset commits, no later failure may restore the old graph.
+                replacement = Backend(options, evidence_budget=self.storage.check_write)
+                result = self.storage.reset_current(token)
+                self.backend = replacement
+                self.backend.store_dir = self.run_dir / 'evidence'
+                self.map_generation = uuid.uuid4().hex
+                self.map_reset_error = None
+                with self.scheduler.lock:
+                    self.map_epoch_started = time.monotonic()
+                    self.scheduler.pending.clear()
+                with self.state_lock:
+                    self.cached = self.backend.snapshot()
+                    for state in self.telemetry.values():
+                        for key in ('last_mapped_monotonic', 'map_finished_monotonic', 'shared_evidence_monotonic',
+                                    'last_processed_monotonic', 'last_processed_stamp_ns', 'pose_quality', 'counts', 'last_error'):
+                            state.pop(key, None)
+                        state['status'] = 'waiting_for_input'
+                    self.images = {key: value for key, value in self.images.items() if key[1] in ('rgb', 'depth')}
+                warnings = [result['warning']] if result.get('warning') else []
+                try:
+                    if self.fleet:
+                        self.fleet.reset_maps()
+                except Exception as error:
+                    self.map_reset_error = f'Local map reset failed; rebuild again or restart: {error}'
+                    warnings.append(self.map_reset_error)
+                    with self.state_lock:
+                        for state in self.telemetry.values():
+                            state.update(status='processing_error', last_error=self.map_reset_error)
+                self.next_idle_verification = time.monotonic() + 8.
+                try:
+                    self.backend.command({'action': 'save'})
+                except Exception as error:
+                    warnings.append(f'Map was cleared, but its empty checkpoint could not be saved: {error}')
+                if warnings:
+                    result['warning'] = ' '.join(warnings)
+            self.event('map_rebuilt', 'Current map evidence cleared by operator; rebuilding from fresh observations')
+            return dict(ok=True, operation=operation, result=result, storage=self.storage.inventory(force=True))
 
     def close(self):
         if self._closed:
@@ -425,6 +568,10 @@ class FleetApplication:
                 self.publisher_node.destroy_node()
             if self.context:
                 self.context.try_shutdown()
+        if self.storage and not busy:
+            self.storage.close()
+        # A still-running inference worker may finish writing after close().
+        # Keep the recording's ownership lock until process exit in that case.
 
 
 def check_environment(config, demo=False):
@@ -445,7 +592,7 @@ def check_environment(config, demo=False):
             raise RuntimeError(f'eSAM checkpoint not found: {path}')
         from collab_perception import PerceptionFleet
         PerceptionFleet(config)  # Validate shared-model settings; loads no model or ROS node.
-        if os.environ.get('ROS_LOCALHOST_ONLY') == '1':
+        if os.environ.get('ROS_LOCALHOST_ONLY') == '1' and not config['input'].get('use_sim_time', False):
             print('Warning: ROS_LOCALHOST_ONLY=1 prevents discovery of remote rovers; unset it for the live two-rover run.', file=sys.stderr)
 
 
@@ -535,7 +682,15 @@ def main(argv=None):
         if not config_file.exists():
             config_file.write_text(json.dumps(config, indent=2)+'\n')
         os.environ.setdefault('ROS_LOG_DIR', str(run_dir/'ros_logs'))
-        app = FleetApplication(config, run_dir, demo=args.demo, replay=bool(args.replay))
+        from collab_storage import StorageManager
+        storage = StorageManager(ROOT / '.runtime' / 'collaboration', run_dir,
+                                 readonly=bool(args.replay), owned_domain=config['central_domain'],
+                                 domain_lock_held=not bool(args.replay), **config['storage'])
+        try:
+            app = FleetApplication(config, run_dir, demo=args.demo, replay=bool(args.replay), storage=storage)
+        except Exception:
+            storage.close()
+            raise
         shutdown = threading.Event()
         def stop(*_):
             shutdown.set()

@@ -103,6 +103,44 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(self.request('POST', '/api/command', json.dumps(payload), headers)[0], 200)
             self.assertEqual(self.commands[-1], payload)
 
+    def test_storage_preview_and_confirmation_require_same_origin_token(self):
+        headers = self.command_headers()
+        headers['Origin'] = f'http://127.0.0.1:{self.dashboard.port}'
+        payloads = [
+            {'action': 'prepare_storage', 'operation': 'rebuild_current'},
+            {'action': 'prepare_storage', 'operation': 'delete_runs', 'run_ids': ['recording-one']},
+            {'action': 'confirm_storage', 'token': 'application-preview-token'},
+        ]
+        for payload in payloads:
+            with self.subTest(action=payload):
+                status, _, body = self.request('POST', '/api/command', json.dumps(payload), headers)
+                self.assertEqual(status, 200)
+                self.assertTrue(json.loads(body)['ok'])
+                self.assertEqual(self.commands[-1], payload)
+        self.assertEqual(self.commands, payloads)
+
+    def test_storage_commands_cannot_bypass_auth_or_origin_checks(self):
+        valid = self.command_headers()
+        same_origin = f'http://127.0.0.1:{self.dashboard.port}'
+        invalid_headers = [
+            {'Content-Type': 'application/json', 'Origin': same_origin},
+            {**valid, 'Origin': same_origin, 'X-CrossMaps-Token': 'wrong-dashboard-token'},
+            {**valid, 'Origin': 'https://attacker.example'},
+            {**valid, 'Origin': 'http://127.0.0.1:1'},
+            {**valid, 'Origin': 'http://attacker.example', 'Host': 'attacker.example'},
+        ]
+        for action in ('prepare_storage', 'confirm_storage'):
+            payload = json.dumps({'action': action, 'operation': 'delete_runs',
+                                  'run_ids': ['recording-one'], 'token': 'application-preview-token'})
+            for headers in invalid_headers:
+                with self.subTest(action=action, headers=headers):
+                    self.assertEqual(self.request('POST', '/api/command', payload, headers)[0], 403)
+        self.assertEqual(self.commands, [])
+
+    def test_storage_confirmation_is_not_a_get_side_effect(self):
+        self.assertEqual(self.request('GET', '/api/command?action=confirm_storage&token=preview')[0], 404)
+        self.assertEqual(self.commands, [])
+
     def test_unknown_nonfinite_and_oversized_commands(self):
         headers = self.command_headers()
         for body in ('{"action":"move_robot"}', '[]', '{"action":"anchor","x":NaN}', 'broken'):

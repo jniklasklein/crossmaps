@@ -14,7 +14,9 @@ def rejected(*_, **__):
 
 class RetrievalCoverageTests(unittest.TestCase):
     def test_stale_counterpart_does_not_pin_the_budget_to_two_frames(self):
-        backend = Backend(dict(candidate_top_k=2, submap_keyframes=1))
+        # This fixture exercises scheduling across ten retained frames, not
+        # stationary admission (covered independently by test_collab_retention).
+        backend = Backend(dict(candidate_top_k=2, submap_keyframes=1, stationary_bootstrap_keyframes=16))
         def scores(_a, b):
             return {'clip': .99-.001*b['seq'], 'dino': .93-.001*b['seq']}
         pairs = []
@@ -99,7 +101,7 @@ class RetrievalCoverageTests(unittest.TestCase):
             self.assertLessEqual(sum(c['source_submap']==str(i) for c in plan.pending.values()), plan.PER_SUBMAP_PAIR)
 
     def test_idle_coverage_eventually_checks_even_non_retrieved_pairs(self):
-        backend = Backend(dict(verifications_per_keyframe=1, candidate_top_k=1))
+        backend = Backend(dict(verifications_per_keyframe=1, candidate_top_k=1, stationary_bootstrap_keyframes=8))
         with patch.object(backend, '_scores', return_value={'clip': .97}), \
                 patch('collab_backend.verify_rgbd', side_effect=rejected) as check:
             for robot, n in [('A', 7), ('B', 5)]:

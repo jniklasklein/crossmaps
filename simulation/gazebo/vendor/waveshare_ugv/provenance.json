@@ -1,0 +1,23 @@
+{
+  "source": "/Users/niklasklein/ugv_ws/src",
+  "upstream_project": "https://github.com/waveshareteam/ugv_ws",
+  "origin": "Existing local robot description workspace; no upstream revision available",
+  "license_declared_by_package_xml": "BSD",
+  "license_caveat": "Source snapshot has no standalone license/copyright file; preserve package.xml and obtain upstream terms before redistributing assets outside this project.",
+  "modifications": "Imported files byte-for-byte. SDF conversion and collision simplification occur only in generated world.",
+  "sha256": {
+    "urdf/ugv_rover.urdf": "3f171e3122fc461c9d7218eca63d59e20282c34b5527f88fc28f2df3637ee569",
+    "package.xml": "e5afc8a98a78b48f6071ec053d4a8c6ee395b22b957f85021d0969dc33df28b5",
+    "meshes/ugv_rover/3d_camera_link.stl": "e2338cf2b230cbccd07c8168689eb725aac5a04f23729efb55f936ff0e2ff16f",
+    "meshes/ugv_rover/base_lidar_link.stl": "50b03dbd9e678a2edefb0a1ed22914228440d5bbec4877541098e4d151bf9b12",
+    "meshes/ugv_rover/base_link.stl": "75735ebce7f8cf680ebf34b579e68fd84cf8c510801bad795f3d0eec60c44573",
+    "meshes/ugv_rover/left_down_wheel_link.stl": "16dcde1e4f1cb21b79c42edd492505d8d8bbf26ccd38ed840bf13d1dd310c6ad",
+    "meshes/ugv_rover/left_up_wheel_link.stl": "16dcde1e4f1cb21b79c42edd492505d8d8bbf26ccd38ed840bf13d1dd310c6ad",
+    "meshes/ugv_rover/pt_base_link.stl": "ef7ac5759c7583e94fddedab5582f349539e902b5d1f091b2a364976a8a3c920",
+    "meshes/ugv_rover/pt_camera_link.stl": "b5e42f99c959d8d8efc9897642ed0ba1db0b8fd6c813183ddc4e949df1162bfc",
+    "meshes/ugv_rover/pt_link1.stl": "6bab5ae468dec02a8c220e9c1c9209dae6d144266380867859b8cffde007699b",
+    "meshes/ugv_rover/pt_link2.stl": "62ed1c00da5c1166fd64c93a92b5aa5f4a3cab0e140ad5414c8ed49e39bf6e7e",
+    "meshes/ugv_rover/right_down_wheel_link.stl": "94b918d69dca1136833fc6cc20e959a65a41089ce985cd2ed80a889f0e6442f0",
+    "meshes/ugv_rover/right_up_wheel_link.stl": "94b918d69dca1136833fc6cc20e959a65a41089ce985cd2ed80a889f0e6442f0"
+  }
+}
